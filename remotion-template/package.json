@@ -1,0 +1,20 @@
+{
+  "name": "overseas-news-remotion",
+  "private": true,
+  "version": "0.0.1",
+  "description": "35 秒海外快讯模板占位 — 接入见 README",
+  "scripts": {
+    "preview": "remotion preview src/index.ts",
+    "render": "remotion render src/index.ts Main out/video.mp4"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@remotion/cli": "^4.0.0",
+    "@types/react": "^18.3.0",
+    "typescript": "^5.6.0"
+  }
+}

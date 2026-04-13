@@ -1,0 +1,18 @@
+# 海外新闻视频工厂 — MVP 后端
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.36
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+httpx>=0.27.0
+feedparser>=6.0.11
+trafilatura>=1.12.0
+python-multipart>=0.0.12
+aiosqlite>=0.20.0
+greenlet>=3.1.0
+
+# 可选：PostgreSQL（DATABASE_URL=postgresql+asyncpg://...）
+# asyncpg>=0.30.0
+
+# 可选：脚本生成（OpenAI 兼容）
+openai>=1.55.0
