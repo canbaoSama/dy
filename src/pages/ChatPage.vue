@@ -1,16 +1,53 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import dayjs from 'dayjs'
+import { v4 as uuidv4 } from 'uuid'
+import { ElMessage } from 'element-plus'
 import JobStatusPanel from '@/components/JobStatusPanel.vue'
 import { AGENT_NAME } from '@/config/app'
 import { QUICK_COMMANDS } from '@/constants/commands'
+import { PIPELINE_STAGES, pipelineStageIndex, pipelineStageUi } from '@/constants/pipeline'
+import { TTS_VOICE_OPTIONS } from '@/constants/tts'
+import { previewTtsVoice } from '@/api/factory'
 import { useChatStore } from '@/store/chat'
+import type { ChatMessage } from '@/types/chat'
+import type { JobDetailResponse } from '@/types/job'
+import { splitAssistantRichSegments } from '@/utils/assistantRichText'
+import { formatJobArtifact, type JobArtifactKind } from '@/utils/jobArtifactChat'
+import { buildPipelineStageBody } from '@/utils/pipelineChat'
 
 const chatStore = useChatStore()
+/** 最近一次任务详情（与右侧 Job 面板同源），用于「脚本 / 字幕」等快捷展示 */
+const lastJobDetail = ref<JobDetailResponse | null>(null)
+/** 各任务上一次轮询到的状态，用于在对话里推送「阶段完成」卡片 */
+const lastPollStatus = ref<Record<number, string | undefined>>({})
 const input = ref('')
 const listRef = ref<HTMLElement | null>(null)
 const uploadRef = ref<HTMLInputElement | null>(null)
+const rerenderForm = reactive({
+  duration_sec: 18,
+  subtitle_tone: 'brief',
+  tts_voice: 'zh-CN-XiaoxiaoNeural',
+  must_use_uploaded_assets: false,
+  prefer_video_assets: true,
+})
 
 const canSend = computed(() => input.value.trim().length > 0 && !chatStore.loading)
+const previewingVoice = ref(false)
+const previewReqSeq = ref(0)
+let previewAudio: HTMLAudioElement | null = null
+
+const artifactQuickItems = computed(() => {
+  const d = lastJobDetail.value
+  const jid = chatStore.activeJobId
+  if (d == null || jid == null || d.job.id !== jid) return []
+  return [
+    { kind: 'script' as const, label: '脚本' },
+    { kind: 'subtitles' as const, label: '字幕' },
+    { kind: 'audios' as const, label: '音频' },
+    { kind: 'videos' as const, label: '视频' },
+  ] as const
+})
 
 async function sendText(text: string) {
   const v = text.trim()
@@ -32,12 +69,158 @@ watch(
   },
 )
 
+watch(
+  () => rerenderForm.tts_voice,
+  async (voice, prev) => {
+    const v = String(voice || '').trim()
+    if (!v || !prev || v === prev) return
+    const reqId = ++previewReqSeq.value
+    previewingVoice.value = true
+    try {
+      const blob = await previewTtsVoice(v)
+      if (reqId !== previewReqSeq.value) return
+      if (previewAudio) {
+        previewAudio.pause()
+        previewAudio = null
+      }
+      const url = URL.createObjectURL(blob)
+      const audio = new Audio(url)
+      previewAudio = audio
+      audio.onended = () => {
+        URL.revokeObjectURL(url)
+        if (previewAudio === audio) previewAudio = null
+      }
+      audio.onerror = () => {
+        URL.revokeObjectURL(url)
+      }
+      await audio.play()
+    } catch (e) {
+      if (reqId === previewReqSeq.value) {
+        ElMessage.warning(e instanceof Error ? e.message : '音色试听失败')
+      }
+    } finally {
+      if (reqId === previewReqSeq.value) previewingVoice.value = false
+    }
+  },
+)
+
 async function onSend() {
   await sendText(input.value)
 }
 
 function onClear() {
+  // 保留 lastPollStatus，避免清空会话后下一轮轮询又把整条流水线重复推一遍
   chatStore.clear()
+}
+
+function assistantSegments(item: ChatMessage) {
+  if (item.role !== 'assistant' || item.bubbleKind === 'pipeline') {
+    return [{ type: 'text' as const, text: item.content }]
+  }
+  return splitAssistantRichSegments(item.content)
+}
+
+onMounted(() => {
+  void chatStore.bootstrapTodayCandidates()
+})
+
+onBeforeUnmount(() => {
+  if (previewAudio) {
+    previewAudio.pause()
+    previewAudio = null
+  }
+})
+
+function pushPipelineBubble(jobId: number, stageKey: string, body: string) {
+  const ui = pipelineStageUi(stageKey)
+  chatStore.appendAssistantMessage({
+    id: uuidv4(),
+    role: 'assistant',
+    content: body,
+    createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    bubbleKind: 'pipeline',
+    pipeline: {
+      jobId,
+      stageKey,
+      title: ui.label,
+      icon: ui.icon,
+      accent: ui.accent,
+    },
+  })
+}
+
+function handleJobDetail(d: JobDetailResponse) {
+  try {
+    if (!d?.job?.id) return
+    lastJobDetail.value = d
+    const jid = d.job.id
+    const cur = d.job.status
+
+  if (cur === 'failed') {
+    const fs = d.job.failed_stage || '未知阶段'
+    const errMsg = (d.job.error_message || '').trim()
+    const ui = pipelineStageUi('failed')
+    chatStore.appendAssistantMessage({
+      id: uuidv4(),
+      role: 'assistant',
+      content: `流水线失败\n阶段：${fs}\n${errMsg || '（无详细错误信息）'}`,
+      createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      bubbleKind: 'pipeline',
+      pipeline: {
+        jobId: jid,
+        stageKey: 'failed',
+        title: ui.label,
+        icon: ui.icon,
+        accent: ui.accent,
+      },
+    })
+    lastPollStatus.value[jid] = cur
+    return
+  }
+
+  const prev = lastPollStatus.value[jid]
+
+  if (prev === undefined) {
+    const i = pipelineStageIndex(cur)
+    if (i > 0) {
+      for (let k = 0; k < i; k++) {
+        const sk = PIPELINE_STAGES[k].key
+        if (sk === 'created') continue
+        pushPipelineBubble(jid, sk, buildPipelineStageBody(sk, d))
+      }
+    }
+    if (cur === 'ready_for_review' || cur === 'approved') {
+      pushPipelineBubble(jid, cur, buildPipelineStageBody(cur, d))
+    }
+    lastPollStatus.value[jid] = cur
+    return
+  }
+
+  if (prev === cur) {
+    return
+  }
+
+  const pi = pipelineStageIndex(cur)
+  const pj = pipelineStageIndex(prev)
+  if (pi >= 0 && pj >= 0 && pi < pj) {
+    lastPollStatus.value[jid] = undefined
+    chatStore.appendAssistantMessage({
+      id: uuidv4(),
+      role: 'assistant',
+      content: `任务 #${jid} 已重新进入流水线，将分步推送进度。`,
+      createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    })
+    handleJobDetail(d)
+    return
+  }
+
+  if (prev !== 'created') {
+    pushPipelineBubble(jid, prev, buildPipelineStageBody(prev, d))
+  }
+  lastPollStatus.value[jid] = cur
+  } catch (e) {
+    console.error('handleJobDetail', e)
+  }
 }
 
 function onStatusChange(payload: { jobId: number; status: string }) {
@@ -56,6 +239,29 @@ async function onQuickSend(text: string) {
   await sendText(text)
 }
 
+function appendArtifactToChat(kind: JobArtifactKind) {
+  const d = lastJobDetail.value
+  const jid = chatStore.activeJobId
+  if (d == null || jid == null || d.job.id !== jid) {
+    chatStore.appendAssistantMessage({
+      id: uuidv4(),
+      role: 'assistant',
+      content: '【产物查看】请先在右侧选择任务，并点「刷新状态」等详情加载完成后再试。',
+      createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    })
+    void scrollToBottom()
+    return
+  }
+  chatStore.appendAssistantMessage({
+    id: uuidv4(),
+    role: 'assistant',
+    content: formatJobArtifact(kind, d),
+    createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    bubbleKind: 'code',
+  })
+  void scrollToBottom()
+}
+
 function onPickAssets() {
   uploadRef.value?.click()
 }
@@ -66,6 +272,20 @@ async function onAssetsChange(e: Event) {
   if (!files.length) return
   await chatStore.uploadAssets(files)
   el.value = ''
+}
+
+function bumpRerenderDuration(delta: number) {
+  rerenderForm.duration_sec = Math.min(22, Math.max(12, Math.round(Number(rerenderForm.duration_sec) + delta)))
+}
+
+async function onRerenderWithConfig() {
+  await chatStore.rerenderActiveJob({
+    duration_sec: rerenderForm.duration_sec,
+    subtitle_tone: rerenderForm.subtitle_tone,
+    tts_voice: rerenderForm.tts_voice,
+    must_use_uploaded_assets: rerenderForm.must_use_uploaded_assets,
+    prefer_video_assets: rerenderForm.prefer_video_assets,
+  })
 }
 
 async function onInputEnter(e: KeyboardEvent) {
@@ -90,7 +310,6 @@ function tierClass(tier: string) {
           <h1 class="title">海外新闻视频工厂</h1>
         </div>
         <div class="actions">
-          <span v-if="chatStore.activeJobId != null" class="job-tag">任务 #{{ chatStore.activeJobId }}</span>
           <el-button class="btn-green" type="primary" :loading="chatStore.ingestLoading" @click="chatStore.runIngest()">
             抓取新闻
           </el-button>
@@ -103,7 +322,7 @@ function tierClass(tier: string) {
           <div class="candidates">
             <div class="section-bar">
               <span class="section-title">候选</span>
-              <span class="section-sub">点击即可开始渲染</span>
+              <span class="section-sub">美东当日热点优先 · 点击一键渲染</span>
             </div>
             <div v-if="chatStore.lastCandidates?.length" class="candidate-list">
               <div v-for="c in chatStore.lastCandidates" :key="c.index" class="candidate-card">
@@ -114,9 +333,16 @@ function tierClass(tier: string) {
                   </a>
                 </div>
                 <div v-if="c.title_zh && c.title_zh !== c.title" class="src">原文：{{ c.title }}</div>
-                <div v-if="c.summary_zh" class="src">{{ c.summary_zh }}</div>
+                <div v-if="c.summary_zh || c.summary" class="src">{{ c.summary_zh || c.summary }}</div>
                 <div class="candidate-actions">
-                  <span class="src">{{ c.source }}<span v-if="c.score_10 != null"> · {{ c.score_10 }}分</span></span>
+                  <span class="src">
+                    {{ c.source }}
+                    <span v-if="c.heat_index != null"> · 热度指数 {{ c.heat_index }}</span>
+                    <span v-else-if="c.score_10 != null"> · 热度 {{ c.score_10 }}</span>
+                    <span v-if="c.rank_score_10 != null"> · 综合 {{ c.rank_score_10 }}</span>
+                    <span v-if="c.source_weight != null"> · 来源权重 {{ c.source_weight }}</span>
+                    <span v-if="c.recency_score_10 != null"> · 时效 {{ c.recency_score_10 }}</span>
+                  </span>
                   <div class="candidate-actions-right">
                     <span class="tier" :class="tierClass(c.tier)">{{ c.tier }}</span>
                     <button type="button" class="start-btn" :disabled="chatStore.loading" @click="onStartCandidate(c.index)">
@@ -131,6 +357,87 @@ function tierClass(tier: string) {
         </aside>
 
         <section class="right-panel">
+          <div class="rerender-panel card">
+            <div class="rerender-bar">
+              <span class="rerender-bar-title">重生成配置</span>
+              <div class="rerender-items">
+                <div class="rerender-item">
+                  <label class="rerender-lbl" for="rerender-duration" title="视频时长，12～22 秒">时长</label>
+                  <div id="rerender-duration" class="rerender-stepper" title="范围 12～22 秒">
+                    <button
+                      type="button"
+                      class="step-btn"
+                      aria-label="减 1 秒"
+                      :disabled="rerenderForm.duration_sec <= 12 || chatStore.loading"
+                      @click="bumpRerenderDuration(-1)"
+                    >
+                      −
+                    </button>
+                    <span class="step-value">{{ rerenderForm.duration_sec }}</span>
+                    <button
+                      type="button"
+                      class="step-btn"
+                      aria-label="加 1 秒"
+                      :disabled="rerenderForm.duration_sec >= 22 || chatStore.loading"
+                      @click="bumpRerenderDuration(1)"
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+                <div class="rerender-item">
+                  <label class="rerender-lbl" for="rerender-sub">字幕</label>
+                  <el-select
+                    id="rerender-sub"
+                    v-model="rerenderForm.subtitle_tone"
+                    size="small"
+                    class="rerender-select"
+                    fit-input-width
+                    popper-class="rerender-select-dropdown rerender-subtitle-dropdown"
+                  >
+                    <el-option label="精简字幕" value="brief" />
+                    <el-option label="标准字幕" value="normal" />
+                  </el-select>
+                </div>
+                <div class="rerender-item">
+                  <label class="rerender-lbl" for="rerender-voice">音色</label>
+                  <el-select
+                    id="rerender-voice"
+                    v-model="rerenderForm.tts_voice"
+                    size="small"
+                    class="rerender-select rerender-select-voice"
+                    :loading="previewingVoice"
+                    filterable
+                    allow-create
+                    default-first-option
+                    reserve-keyword
+                    placeholder="搜索或输入 voice"
+                    popper-class="rerender-select-dropdown rerender-voice-dropdown"
+                  >
+                    <el-option v-for="v in TTS_VOICE_OPTIONS" :key="v.value" :label="v.label" :value="v.value" />
+                  </el-select>
+                </div>
+                <div class="rerender-item rerender-item-switch">
+                  <span class="rerender-lbl rerender-lbl-wide" title="开启后仅使用已上传素材">仅已上传</span>
+                  <el-switch v-model="rerenderForm.must_use_uploaded_assets" size="small" />
+                </div>
+                <div class="rerender-item rerender-item-switch">
+                  <span class="rerender-lbl rerender-lbl-wide" title="关闭则优先静态图">优先视频</span>
+                  <el-switch v-model="rerenderForm.prefer_video_assets" size="small" />
+                </div>
+              </div>
+              <el-button
+                class="btn-green rerender-submit-btn"
+                type="primary"
+                size="small"
+                :disabled="chatStore.activeJobId == null || chatStore.loading"
+                @click="onRerenderWithConfig"
+              >
+                应用并重跑
+              </el-button>
+            </div>
+          </div>
+
           <div ref="listRef" class="chat">
             <div v-if="chatStore.messages.length === 0" class="empty">
               <p class="empty-title">还没有消息</p>
@@ -143,19 +450,70 @@ function tierClass(tier: string) {
                   <div class="meta">
                     {{ item.role === 'user' ? '你' : AGENT_NAME }} · {{ item.createdAt }}
                   </div>
-                  <div class="bubble" :class="item.role === 'user' ? 'is-user' : 'is-bot'">
-                    <p class="text">{{ item.content }}</p>
+                  <div
+                    v-if="item.bubbleKind === 'pipeline' && item.pipeline"
+                    class="bubble pipeline-bubble"
+                    :data-accent="item.pipeline.accent"
+                  >
+                    <div class="pipe-head">
+                      <span class="pipe-icon" aria-hidden="true">{{ item.pipeline.icon }}</span>
+                      <div class="pipe-head-text">
+                        <div class="pipe-kicker">任务 #{{ item.pipeline.jobId }}</div>
+                        <div class="pipe-title">{{ item.pipeline.title }}</div>
+                      </div>
+                    </div>
+                    <pre class="pipe-body">{{ item.content }}</pre>
+                  </div>
+                  <div
+                    v-else-if="item.role === 'assistant' && item.bubbleKind === 'code'"
+                    class="bubble is-bot artifact-bubble"
+                  >
+                    <pre class="artifact-pre">{{ item.content }}</pre>
+                  </div>
+                  <div v-else class="bubble" :class="item.role === 'user' ? 'is-user' : 'is-bot'">
+                    <p v-if="item.role === 'user'" class="text">{{ item.content }}</p>
+                    <p v-else class="text plain-rich">
+                      <template v-for="(seg, si) in assistantSegments(item)" :key="si">
+                        <span v-if="seg.type === 'index'" class="seg-index">{{ seg.text }}</span>
+                        <span v-else-if="seg.type === 'source'" class="seg-source">{{ seg.text }}</span>
+                        <span v-else>{{ seg.text }}</span>
+                      </template>
+                    </p>
                   </div>
                 </div>
                 <div v-if="item.role === 'user'" class="avatar user">我</div>
               </div>
             </template>
+            <div v-if="chatStore.loading" class="row row-bot row-loading">
+              <div class="avatar bot">{{ AGENT_NAME.slice(0, 1) }}</div>
+              <div class="bubble-block">
+                <div class="meta">{{ AGENT_NAME }} · 正在思考</div>
+                <div class="bubble is-bot typing-bubble" aria-live="polite">
+                  <span class="typing-dot" />
+                  <span class="typing-dot" />
+                  <span class="typing-dot" />
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="quick">
             <button v-for="q in QUICK_COMMANDS" :key="q.text" type="button" class="chip" @click="onQuickSend(q.text)">
               {{ q.label }}
             </button>
+            <template v-if="artifactQuickItems.length">
+              <span class="quick-sep" aria-hidden="true" />
+              <button
+                v-for="a in artifactQuickItems"
+                :key="a.kind"
+                type="button"
+                class="chip chip-artifact"
+                :title="`在对话中展示当前任务的${a.label}数据`"
+                @click="appendArtifactToChat(a.kind)"
+              >
+                {{ a.label }}
+              </button>
+            </template>
           </div>
 
           <div class="composer">
@@ -225,7 +583,11 @@ function tierClass(tier: string) {
               />
             </el-select>
           </div>
-          <JobStatusPanel :job-id="chatStore.activeJobId" @status-change="onStatusChange" />
+          <JobStatusPanel
+            :job-id="chatStore.activeJobId"
+            @status-change="onStatusChange"
+            @job-detail="handleJobDetail"
+          />
         </aside>
       </section>
     </div>
@@ -283,16 +645,6 @@ function tierClass(tier: string) {
   gap: 10px;
 }
 
-.job-tag {
-  font-size: 13px;
-  font-weight: 700;
-  color: #d1fae5;
-  background: rgba(16, 185, 129, 0.3);
-  border: 1px solid rgba(110, 231, 183, 0.45);
-  padding: 6px 12px;
-  border-radius: 999px;
-}
-
 .shell {
   overflow: visible;
   display: grid;
@@ -319,9 +671,199 @@ function tierClass(tier: string) {
 .right-panel {
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   background: rgba(30, 41, 59, 0.52);
   overflow: hidden;
+}
+
+.rerender-panel {
+  --rerender-lbl-w: 48px;
+  --rerender-ctl-h: 26px;
+  margin: 8px 8px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: linear-gradient(165deg, rgba(30, 41, 59, 0.92), rgba(15, 23, 42, 0.88));
+  box-shadow: 0 12px 28px rgba(2, 6, 23, 0.28);
+  overflow-x: auto;
+}
+
+.rerender-bar {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px 4px;
+  min-width: 0;
+}
+
+.rerender-bar-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #f8fafc;
+  letter-spacing: -0.02em;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--rerender-ctl-h);
+}
+
+.rerender-items {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 2px 3px;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.rerender-item {
+  display: inline-grid;
+  grid-template-columns: var(--rerender-lbl-w) auto;
+  align-items: center;
+  align-content: center;
+  column-gap: 1px;
+  min-width: 0;
+}
+
+.rerender-item {
+  flex-shrink: 0;
+}
+
+.rerender-lbl {
+  box-sizing: border-box;
+  width: var(--rerender-lbl-w);
+  min-height: var(--rerender-ctl-h);
+  padding-right: 2px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: var(--rerender-ctl-h);
+  color: #cbd5e1;
+  white-space: nowrap;
+  text-align: right;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.rerender-lbl-wide {
+  width: 72px;
+}
+
+.rerender-item-switch {
+  grid-template-columns: 72px auto;
+  column-gap: 4px;
+}
+
+.rerender-item-switch .rerender-lbl {
+  width: 72px;
+}
+
+.rerender-stepper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 74px;
+  height: var(--rerender-ctl-h);
+  border-radius: 5px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  overflow: hidden;
+  background: rgba(15, 23, 42, 0.88);
+}
+
+.step-btn {
+  box-sizing: border-box;
+  width: 22px;
+  height: var(--rerender-ctl-h);
+  border: none;
+  margin: 0;
+  padding: 0;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.55);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.step-btn:hover:not(:disabled) {
+  background: rgba(71, 85, 105, 0.88);
+  color: #fff;
+}
+
+.step-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.step-value {
+  box-sizing: border-box;
+  min-width: 1.5rem;
+  padding: 0 4px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: #f8fafc;
+  line-height: var(--rerender-ctl-h);
+}
+
+.rerender-select {
+  width: 104px;
+  min-width: 104px;
+  max-width: 104px;
+}
+
+.rerender-select-voice {
+  width: 160px;
+  min-width: 160px;
+  max-width: 160px;
+}
+
+.rerender-submit-btn {
+  flex-shrink: 0;
+  font-weight: 800;
+  align-self: center;
+}
+
+.rerender-item :deep(.el-switch) {
+  display: inline-flex;
+  align-items: center;
+}
+
+.rerender-panel :deep(.rerender-select .el-select__wrapper) {
+  box-sizing: border-box;
+  height: var(--rerender-ctl-h);
+  min-height: var(--rerender-ctl-h);
+  padding: 0 6px;
+  font-size: 13px;
+  line-height: var(--rerender-ctl-h);
+  border-radius: 5px;
+  background: rgba(15, 23, 42, 0.88);
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.45) inset;
+  transition: box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.rerender-panel :deep(.rerender-select .el-select__wrapper:hover:not(.is-disabled)) {
+  box-shadow: 0 0 0 1px rgba(186, 199, 216, 0.55) inset;
+}
+
+.rerender-panel :deep(.rerender-select .el-select__wrapper.is-focused) {
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.65) inset;
+}
+
+.rerender-panel :deep(.rerender-select .el-select__selected-item) {
+  color: #f1f5f9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.rerender-panel :deep(.rerender-select .el-select__caret) {
+  color: #cbd5e1;
+  font-size: 12px;
 }
 
 .job-panel {
@@ -580,6 +1122,10 @@ function tierClass(tier: string) {
   justify-content: flex-start;
 }
 
+.row-loading .bubble-block {
+  min-width: 90px;
+}
+
 .avatar {
   flex-shrink: 0;
   width: 36px;
@@ -640,10 +1186,155 @@ function tierClass(tier: string) {
   border-bottom-left-radius: 4px;
 }
 
+.typing-bubble {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 11px 14px;
+  background: linear-gradient(180deg, rgba(30, 41, 59, 0.86), rgba(15, 23, 42, 0.9));
+}
+
+.typing-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  opacity: 0.35;
+  animation: typingPulse 1.2s ease-in-out infinite;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typingPulse {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  40% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
 .text {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.plain-rich {
+  white-space: pre-wrap;
+}
+
+.seg-index {
+  color: #7dd3fc;
+  font-weight: 700;
+}
+
+.seg-source {
+  color: #c4b5fd;
+  font-weight: 600;
+}
+
+.pipeline-bubble {
+  padding: 0;
+  overflow: hidden;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(15, 23, 42, 0.72);
+  max-width: 100%;
+}
+
+.pipeline-bubble[data-accent='slate'] {
+  border-color: rgba(148, 163, 184, 0.5);
+  box-shadow: 0 0 0 1px rgba(100, 116, 139, 0.2);
+}
+.pipeline-bubble[data-accent='violet'] {
+  border-color: rgba(167, 139, 250, 0.55);
+  box-shadow: 0 8px 24px rgba(109, 40, 217, 0.18);
+}
+.pipeline-bubble[data-accent='amber'] {
+  border-color: rgba(251, 191, 36, 0.5);
+  box-shadow: 0 8px 24px rgba(217, 119, 6, 0.15);
+}
+.pipeline-bubble[data-accent='emerald'] {
+  border-color: rgba(52, 211, 153, 0.5);
+  box-shadow: 0 8px 24px rgba(16, 185, 129, 0.12);
+}
+.pipeline-bubble[data-accent='sky'] {
+  border-color: rgba(125, 211, 252, 0.5);
+  box-shadow: 0 8px 24px rgba(14, 165, 233, 0.12);
+}
+.pipeline-bubble[data-accent='rose'] {
+  border-color: rgba(251, 113, 133, 0.45);
+  box-shadow: 0 8px 24px rgba(244, 63, 94, 0.12);
+}
+.pipeline-bubble[data-accent='cyan'] {
+  border-color: rgba(34, 211, 238, 0.45);
+  box-shadow: 0 8px 24px rgba(6, 182, 212, 0.12);
+}
+.pipeline-bubble[data-accent='fuchsia'] {
+  border-color: rgba(232, 121, 249, 0.45);
+  box-shadow: 0 8px 24px rgba(192, 38, 211, 0.12);
+}
+.pipeline-bubble[data-accent='orange'] {
+  border-color: rgba(251, 146, 60, 0.55);
+  box-shadow: 0 8px 24px rgba(234, 88, 12, 0.15);
+}
+
+.pipe-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: linear-gradient(90deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.4));
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.pipe-icon {
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.pipe-head-text {
+  min-width: 0;
+}
+
+.pipe-kicker {
+  font-size: 11px;
+  font-weight: 700;
+  color: #94a3b8;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pipe-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #f8fafc;
+}
+
+.pipe-body {
+  margin: 0;
+  padding: 12px 14px 14px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #e2e8f0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
 }
 
 .quick {
@@ -671,6 +1362,43 @@ function tierClass(tier: string) {
   border-color: rgba(216, 180, 254, 0.85);
   color: #f8fafc;
   background: rgba(91, 33, 182, 0.48);
+}
+
+.quick-sep {
+  width: 1px;
+  align-self: stretch;
+  min-height: 28px;
+  margin: 0 2px;
+  background: rgba(148, 163, 184, 0.35);
+}
+
+.chip-artifact {
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(14, 116, 144, 0.22);
+  color: #e0f2fe;
+}
+
+.chip-artifact:hover {
+  border-color: rgba(125, 211, 252, 0.75);
+  background: rgba(8, 145, 178, 0.38);
+  color: #f8fafc;
+}
+
+.artifact-bubble {
+  max-width: 100%;
+}
+
+.artifact-pre {
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #e2e8f0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: min(420px, 55vh);
+  overflow: auto;
 }
 
 .composer {
@@ -833,5 +1561,62 @@ function tierClass(tier: string) {
   .right-panel {
     grid-template-rows: 360px auto auto;
   }
+}
+</style>
+
+<style>
+/* el-select 下拉 teleport 到 body，scoped 样式无法命中 */
+.rerender-select-dropdown.el-popper {
+  min-width: 7.5rem !important;
+  border: 1px solid rgba(148, 163, 184, 0.38) !important;
+  border-radius: 8px !important;
+  background: rgba(15, 23, 42, 0.98) !important;
+  box-shadow: 0 14px 32px rgba(2, 6, 23, 0.55) !important;
+}
+
+.rerender-voice-dropdown.el-popper {
+  width: 160px !important;
+  min-width: 160px !important;
+  max-width: 160px !important;
+}
+
+.rerender-subtitle-dropdown.el-popper {
+  width: 104px !important;
+  min-width: 104px !important;
+  max-width: 104px !important;
+}
+
+.rerender-select-dropdown .el-select-dropdown__item {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  height: 28px;
+  line-height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: #e2e8f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rerender-select-dropdown .el-select-dropdown__item.is-selected {
+  color: #7dd3fc;
+  font-weight: 600;
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.rerender-select-dropdown .el-select-dropdown__item.is-hovering {
+  background: rgba(51, 65, 85, 0.72);
+}
+
+.rerender-select-dropdown .el-select-dropdown__list {
+  padding: 0 !important;
+}
+
+.rerender-select-dropdown .el-select-dropdown__wrap {
+  padding: 0 !important;
 }
 </style>

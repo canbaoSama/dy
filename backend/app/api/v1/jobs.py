@@ -6,18 +6,35 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models import JobAsset, JobStatus, ScriptRecord, SubtitleTimeline, VideoJob
+from app.models import JobAsset, JobStatus, NewsItem, ScriptRecord, SubtitleTimeline, VideoJob
 from app.schemas import AudioOutputBrief, JobDetailOut, JobOut, VideoOutputBrief
 from app.services.candidate_list import query_candidate_rows, serialize_candidates
 from app.services.pipeline import run_job_pipeline
+from app.services.tts_stub import synthesize_preview_mp3
 
 router = APIRouter(tags=["jobs"])
+
+
+class RerenderRequest(BaseModel):
+    instruction: str | None = None
+    duration_sec: int | None = None
+    style_notes: str | None = None
+    must_use_uploaded_assets: bool | None = None
+    prefer_video_assets: bool | None = None
+    subtitle_tone: str | None = None
+    tts_voice: str | None = None
+
+
+class TtsPreviewRequest(BaseModel):
+    voice: str
+    text: str | None = None
 
 
 @router.post("/jobs/from-candidate")
@@ -48,10 +65,43 @@ async def _run_pipeline_bg(job_id: int) -> None:
         await run_job_pipeline(session, job_id)
 
 
+async def _run_pipeline_bg_with_options(job_id: int, options: dict) -> None:
+    async with SessionLocal() as session:
+        await run_job_pipeline(session, job_id, options=options)
+
+
 @router.post("/jobs/{job_id}/pipeline")
 async def trigger_pipeline(job_id: int, background_tasks: BackgroundTasks):
     background_tasks.add_task(_run_pipeline_bg, job_id)
     return {"ok": True, "job_id": job_id, "note": "管线异步执行，请轮询 GET /jobs/{id} 或 GET /jobs/{id}/detail"}
+
+
+@router.post("/jobs/{job_id}/rerender")
+async def trigger_rerender(job_id: int, body: RerenderRequest, background_tasks: BackgroundTasks):
+    options = body.model_dump(exclude_none=True)
+    background_tasks.add_task(_run_pipeline_bg_with_options, job_id, options)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "note": "已按新需求重生成，请轮询任务详情",
+        "options": options,
+    }
+
+
+@router.post("/tts/preview")
+async def preview_tts_voice(body: TtsPreviewRequest):
+    voice = (body.voice or "").strip()
+    if not voice:
+        raise HTTPException(400, "voice 不能为空")
+    sample_text = (body.text or "").strip() or "你好，这是一段音色试听。"
+    p = settings.outputs_dir / "_tts_preview" / f"{voice}.mp3"
+    try:
+        await synthesize_preview_mp3(voice, sample_text, p)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        raise HTTPException(500, f"试听生成失败：{e}") from e
+    return FileResponse(str(p), media_type="audio/mpeg", filename=f"{voice}.mp3")
 
 
 @router.post("/jobs/{job_id}/assets/upload")
@@ -130,8 +180,13 @@ async def get_job_detail(job_id: int, session: AsyncSession = Depends(get_db)):
         .limit(1)
     )
     sc = r_sc.scalar_one_or_none()
-    latest_script = json.loads(sc.payload_json) if sc else None
+    latest_script = None
     latest_version = sc.version if sc else None
+    if sc and (sc.payload_json or "").strip():
+        try:
+            latest_script = json.loads(sc.payload_json)
+        except Exception:
+            latest_script = None
 
     r_tl = await session.execute(
         select(SubtitleTimeline)
@@ -141,6 +196,32 @@ async def get_job_detail(job_id: int, session: AsyncSession = Depends(get_db)):
     )
     st = r_tl.scalar_one_or_none()
 
+    item = await session.get(NewsItem, job.news_item_id)
+    news_title = (item.title or None) if item else None
+    content_chars = len(item.cleaned_content or "") if item and item.cleaned_content else None
+    candidate_score_10 = None
+    candidate_tier = (item.candidate_tier or None) if item else None
+    if item and isinstance(item.score_json, dict):
+        try:
+            raw_total = float(item.score_json.get("total") or 0.0)
+            if raw_total:
+                candidate_score_10 = round(max(0.0, min(raw_total * 10.0 / 7.0, 10.0)), 1)
+        except Exception:
+            pass
+
+    subtitle_cues: list | None = None
+    if st and (st.timeline_json or "").strip():
+        try:
+            raw_tl = json.loads(st.timeline_json)
+            if isinstance(raw_tl, list):
+                subtitle_cues = [x for x in raw_tl if isinstance(x, dict)]
+            elif isinstance(raw_tl, dict):
+                subtitle_cues = [raw_tl]
+            else:
+                subtitle_cues = None
+        except Exception:
+            subtitle_cues = None
+
     return JobDetailOut(
         job=JobOut.model_validate(job),
         latest_script=latest_script,
@@ -148,6 +229,11 @@ async def get_job_detail(job_id: int, session: AsyncSession = Depends(get_db)):
         audios=[AudioOutputBrief.model_validate(a) for a in job.audios],
         videos=[VideoOutputBrief.model_validate(v) for v in job.videos],
         subtitle_timeline_id=st.id if st else None,
+        news_title=news_title,
+        content_chars=content_chars,
+        candidate_score_10=candidate_score_10,
+        candidate_tier=candidate_tier,
+        subtitle_cues=subtitle_cues,
     )
 
 

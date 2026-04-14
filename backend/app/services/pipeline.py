@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import feedparser
@@ -25,9 +26,21 @@ from app.models import (
 from app.services.asset_download import download_binary
 from app.services.content_extract import extract_article
 from app.services.render_stub import render_video_stub
-from app.services.script_gen import generate_script_payload
+from app.services.script_gen import generate_script_payload, rewrite_script_payload
 from app.services.subtitle_build import build_stub_timeline
 from app.services.tts_stub import synthesize_narration
+
+
+def _publish_latest_video(job_id: int, video_path: str | None) -> str | None:
+    """将最新成片同步到项目根 videos/job_{id}_latest.mp4。"""
+    src = Path((video_path or "").strip())
+    if not src.exists():
+        return None
+    videos_dir = settings.data_dir.parent.parent / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    dest = videos_dir / f"job_{job_id}_latest.mp4"
+    shutil.copy2(src, dest)
+    return str(dest)
 
 
 async def _fallback_hero_from_rss(item: NewsItem) -> str | None:
@@ -62,7 +75,7 @@ async def _fallback_hero_from_rss(item: NewsItem) -> str | None:
     return None
 
 
-async def run_job_pipeline(session: AsyncSession, job_id: int) -> VideoJob:
+async def run_job_pipeline(session: AsyncSession, job_id: int, options: dict | None = None) -> VideoJob:
     result = await session.execute(
         select(VideoJob)
         .options(selectinload(VideoJob.news_item).selectinload(NewsItem.source))
@@ -72,6 +85,7 @@ async def run_job_pipeline(session: AsyncSession, job_id: int) -> VideoJob:
     item = job.news_item
 
     tracker: dict[str, str | None] = {"last": None}
+    opts = options or {}
 
     async def advance(st: JobStatus) -> None:
         tracker["last"] = st.value
@@ -101,11 +115,18 @@ async def run_job_pipeline(session: AsyncSession, job_id: int) -> VideoJob:
         await advance(JobStatus.generating_script)
 
         # 新闻简报默认压到短时长，避免冗长口播。
-        target_duration = max(12, min(int(job.duration_sec or 18), 22))
+        req_duration = opts.get("duration_sec")
+        base_duration = int(req_duration) if req_duration is not None else int(job.duration_sec or 18)
+        target_duration = max(12, min(base_duration, 22))
+        if isinstance(opts.get("style_notes"), str) and opts.get("style_notes"):
+            job.style_notes = str(opts.get("style_notes"))
         job.duration_sec = target_duration
         await session.commit()
 
         payload = await generate_script_payload(session, item, duration_sec=target_duration, style=job.style_notes or "快讯")
+        instruction = str(opts.get("instruction") or "").strip()
+        if instruction:
+            payload = rewrite_script_payload(payload, instruction)
         prev_n = await session.scalar(
             select(func.count()).select_from(ScriptRecord).where(ScriptRecord.job_id == job.id)
         )
@@ -160,13 +181,19 @@ async def run_job_pipeline(session: AsyncSession, job_id: int) -> VideoJob:
             + list(payload.get("body") or [])
             + [payload.get("ending", "")]
         )
-        audio_path, duration_sec = await synthesize_narration(narration_text, job_dir, target_duration=target_duration)
+        tts_voice = str(opts.get("tts_voice") or "").strip() or None
+        audio_path, duration_sec = await synthesize_narration(
+            narration_text,
+            job_dir,
+            target_duration=target_duration,
+            voice=tts_voice,
+        )
         session.add(
             AudioOutput(
                 job_id=job.id,
                 file_path=audio_path,
                 duration_sec=duration_sec,
-                meta_json={"provider": settings.tts_provider},
+                meta_json={"provider": settings.tts_provider, "voice": tts_voice},
             )
         )
         await session.commit()
@@ -222,8 +249,12 @@ async def run_job_pipeline(session: AsyncSession, job_id: int) -> VideoJob:
                 "audio_path": audio_path,
                 "user_image_paths": user_image_paths,
                 "user_video_paths": user_video_paths,
+                "must_use_uploaded_assets": bool(opts.get("must_use_uploaded_assets", False)),
+                "prefer_video_assets": bool(opts.get("prefer_video_assets", False)),
+                "subtitle_tone": str(opts.get("subtitle_tone") or "").strip() or None,
             },
         )
+        published_latest = _publish_latest_video(job.id, video_path)
         session.add(
             VideoOutput(
                 job_id=job.id,
@@ -233,6 +264,7 @@ async def run_job_pipeline(session: AsyncSession, job_id: int) -> VideoJob:
                     "titles": payload.get("titles"),
                     "cover_texts": payload.get("cover_texts"),
                     "comment_prompt": payload.get("comment_prompt"),
+                    "published_latest": published_latest,
                     "publish_hint": "完整方案在此回传抖音标题/简介/评论引导",
                 },
             )

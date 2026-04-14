@@ -7,6 +7,7 @@ import type { JobDetailResponse } from '@/types/job'
 const props = defineProps<{ jobId: number | null }>()
 const emit = defineEmits<{
   (e: 'status-change', payload: { jobId: number; status: string }): void
+  (e: 'job-detail', payload: JobDetailResponse): void
 }>()
 
 const detail = ref<JobDetailResponse | null>(null)
@@ -34,6 +35,7 @@ async function load() {
   if (props.jobId == null) {
     detail.value = null
     err.value = null
+    clearTimer()
     return
   }
   loading.value = true
@@ -41,9 +43,17 @@ async function load() {
   try {
     detail.value = await fetchJobDetail(props.jobId)
     emit('status-change', { jobId: props.jobId, status: detail.value.job.status })
+    emit('job-detail', detail.value)
+    const st = detail.value.job.status
+    if (st && TERMINAL.has(st)) {
+      clearTimer()
+    } else if (timer === null) {
+      schedulePoll()
+    }
   } catch (e) {
     detail.value = null
     err.value = e instanceof Error ? e.message : '加载失败'
+    clearTimer()
   } finally {
     loading.value = false
   }
@@ -77,7 +87,7 @@ watch(
       detail.value = null
       return
     }
-    void load().then(() => schedulePoll())
+    void load()
   },
   { immediate: true },
 )
@@ -113,24 +123,6 @@ onBeforeUnmount(() => clearTimer())
     </div>
     <div v-else-if="!err" class="banner banner-muted">正在加载流水线…</div>
 
-    <div v-if="detail" class="meta-grid">
-      <div class="meta-card">
-        <div class="meta-label">脚本版本</div>
-        <div class="meta-value">{{ detail.latest_script_version ?? '—' }}</div>
-      </div>
-      <div class="meta-card">
-        <div class="meta-label">音频</div>
-        <div class="meta-value">{{ detail.audios.length }}</div>
-      </div>
-      <div class="meta-card">
-        <div class="meta-label">视频</div>
-        <div class="meta-value">{{ detail.videos.length }}</div>
-      </div>
-      <div class="meta-card">
-        <div class="meta-label">字幕表</div>
-        <div class="meta-value">{{ detail.subtitle_timeline_id != null ? `#${detail.subtitle_timeline_id}` : '—' }}</div>
-      </div>
-    </div>
     <div v-if="latestVideoUrl" class="video-wrap">
       <div class="video-head">
         <span>最新成片预览</span>
@@ -237,31 +229,13 @@ onBeforeUnmount(() => clearTimer())
   overflow-x: hidden;
 }
 
-.meta-grid {
-  margin: 10px 16px 0;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+.pipeline-wrap::-webkit-scrollbar {
+  width: 8px;
 }
 
-.meta-card {
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  background: linear-gradient(165deg, rgba(15, 23, 42, 0.75), rgba(30, 41, 59, 0.62));
-  border-radius: 10px;
-  padding: 8px 10px;
-}
-
-.meta-label {
-  font-size: 11px;
-  color: #93c5fd;
-  margin-bottom: 2px;
-}
-
-.meta-value {
-  font-size: 15px;
-  font-weight: 800;
-  color: #f8fafc;
-  line-height: 1.2;
+.pipeline-wrap::-webkit-scrollbar-thumb {
+  background: #c9d1d9;
+  border-radius: 99px;
 }
 
 .video-wrap {

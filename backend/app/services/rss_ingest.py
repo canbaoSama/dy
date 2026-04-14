@@ -8,7 +8,7 @@ from typing import Any
 
 import feedparser
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -62,15 +62,26 @@ async def ensure_default_sources(session: AsyncSession) -> list[NewsSource]:
     return [by_url[r["rss_url"]] for r in resolved]
 
 
-async def fetch_and_store_feed(session: AsyncSession, source: NewsSource, limit: int = 15) -> int:
-    """拉取 RSS 并入库；返回新增条数。"""
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        r = await client.get(source.rss_url, headers={"User-Agent": "OverseasNewsFactory/0.1"})
+async def fetch_and_store_feed(session: AsyncSession, source: NewsSource, limit: int = 30) -> tuple[int, int]:
+    """拉取 RSS 并入库。返回 (新增条数, 已存在但刷新 last_seen_at 的条数)。"""
+    client_kwargs: dict[str, object] = {"timeout": 30.0, "follow_redirects": True}
+    proxy = (settings.rss_proxy_url or "").strip()
+    if proxy:
+        client_kwargs["proxy"] = proxy
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        r = await client.get(
+            source.rss_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0 OverseasNewsFactory/1.0"
+            },
+        )
         r.raise_for_status()
         raw = r.text
 
     parsed = feedparser.parse(raw)
     added = 0
+    refreshed = 0
+    now = datetime.now(timezone.utc)
     for entry in parsed.entries[:limit]:
         link = entry.get("link") or entry.get("id")
         if not link:
@@ -79,6 +90,8 @@ async def fetch_and_store_feed(session: AsyncSession, source: NewsSource, limit:
         uh = _url_hash(url)
         exists = await session.execute(select(NewsItem.id).where(NewsItem.url_hash == uh))
         if exists.scalar_one_or_none():
+            await session.execute(update(NewsItem).where(NewsItem.url_hash == uh).values(last_seen_at=now))
+            refreshed += 1
             continue
 
         title = (entry.get("title") or "Untitled").strip()
@@ -94,9 +107,10 @@ async def fetch_and_store_feed(session: AsyncSession, source: NewsSource, limit:
             published_at=published,
             summary_one_liner=summary[:200] if summary else None,
             url_hash=uh,
+            last_seen_at=now,
         )
         session.add(item)
         added += 1
 
     await session.flush()
-    return added
+    return added, refreshed

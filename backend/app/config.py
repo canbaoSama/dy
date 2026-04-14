@@ -38,5 +38,8 @@ class Settings(BaseSettings):
     # 新闻 RSS：逗号分隔 slug，见 us_news_sources_catalog.SOURCE_CATALOG；空=美国时政默认组合
     news_source_slugs: str = ""
 
+    # 出网代理（用于 RSS 抓取）；示例：http://127.0.0.1:7890
+    rss_proxy_url: str | None = None
+
 
 settings = Settings()

@@ -11,9 +11,16 @@ from app.config import settings
 from app.models import NewsItem, NewsSource
 
 
-def _mock_script(item: NewsItem, duration_sec: int, style: str, source_name: str = "") -> dict[str, Any]:
-    title = item.title
-    snippet = (item.summary_one_liner or item.cleaned_content or "")[:400]
+def _mock_script(
+    item: NewsItem,
+    duration_sec: int,
+    style: str,
+    source_name: str = "",
+    zh_title: str = "",
+    zh_snippet: str = "",
+) -> dict[str, Any]:
+    title = (zh_title or item.title or "").strip()
+    snippet = (zh_snippet or (item.summary_one_liner or item.cleaned_content or ""))[:400]
     core = snippet[:90] if snippet else title[:90]
     point_b = snippet[90:180] if len(snippet) > 90 else ""
     point_c = snippet[180:270] if len(snippet) > 180 else ""
@@ -50,7 +57,20 @@ async def generate_script_payload(
             return await _openai_script(item, duration_sec, style)
         except Exception:
             pass
-    return _mock_script(item, duration_sec, style, source_name=source_name)
+    from app.services.candidate_translate import translate_to_zh
+
+    zh_title = (await translate_to_zh(item.title or "")).strip()
+    raw_snippet = (item.summary_one_liner or item.cleaned_content or "")[:400]
+    zh_snippet = (await translate_to_zh(raw_snippet)).strip() if raw_snippet else ""
+    zh_source = (await translate_to_zh(source_name)).strip() if source_name else ""
+    return _mock_script(
+        item,
+        duration_sec,
+        style,
+        source_name=zh_source or source_name,
+        zh_title=zh_title,
+        zh_snippet=zh_snippet,
+    )
 
 
 async def _openai_script(item: NewsItem, duration_sec: int, style: str) -> dict[str, Any]:
@@ -66,6 +86,8 @@ async def _openai_script(item: NewsItem, duration_sec: int, style: str) -> dict[
         "cover_texts(2条短封面字), comment_prompt。要求：只写新闻内容，精简客观，不要出现“要素一/要素二”字样，"
         "不要评论区引导、不要点赞收藏引导。"
         f"总时长约{duration_sec}秒，风格：{style}。"
+        "hook、body、ending、titles、cover_texts 必须全部为简体中文口播/标题用语，不要用英文句子；"
+        "必要的人名、机构缩写可保留原文。"
     )
     resp = await client.chat.completions.create(
         model=settings.script_model,

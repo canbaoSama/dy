@@ -295,6 +295,9 @@ def _split_subtitles(meta: dict) -> list[str]:
     if narration_text:
         lines = [x.strip() for x in narration_text.splitlines() if x.strip()]
         if lines:
+            tone = str(meta.get("subtitle_tone") or "").strip().lower()
+            if tone in {"精简", "brief", "short"}:
+                return [ln[:26] for ln in lines[:4]]
             return lines[:4]
     return _build_segments(meta.get("script") or {})[:4]
 
@@ -342,41 +345,45 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
     subtitle_lines = _split_subtitles(meta)
     font = "/usr/share/fonts/truetype/arphic/uming.ttc"
 
+    must_uploaded = bool(meta.get("must_use_uploaded_assets", False))
+    prefer_video = bool(meta.get("prefer_video_assets", False))
+
     bg_images: list[Path] = []
     for s in list(meta.get("user_image_paths") or []):
         p = Path(str(s))
         if p.exists():
             bg_images.append(p)
-    bg_image = _pick_background_image(job_dir, meta)
-    if bg_image is not None and bg_image.exists():
-        bg_images.append(bg_image)
-    if not bg_images:
-        remote = str(meta.get("hero_image_url") or "").strip()
-        if remote:
-            try:
-                async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
-                    r = await client.get(
-                        remote,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-                            "Referer": str(meta.get("article_url") or remote),
-                            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                        },
-                    )
-                    r.raise_for_status()
-                    remote_hero = job_dir / "remote_hero.jpg"
-                    remote_hero.write_bytes(r.content)
-                    bg_images.append(remote_hero)
-            except Exception:
-                pass
-    extra_images = await _collect_extra_images(job_dir, meta, limit=3)
-    for p in extra_images:
-        if p.exists():
-            bg_images.append(p)
-    web_images = await _collect_web_images(job_dir, meta, limit=3)
-    for p in web_images:
-        if p.exists():
-            bg_images.append(p)
+    if not must_uploaded:
+        bg_image = _pick_background_image(job_dir, meta)
+        if bg_image is not None and bg_image.exists():
+            bg_images.append(bg_image)
+        if not bg_images:
+            remote = str(meta.get("hero_image_url") or "").strip()
+            if remote:
+                try:
+                    async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
+                        r = await client.get(
+                            remote,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                                "Referer": str(meta.get("article_url") or remote),
+                                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                            },
+                        )
+                        r.raise_for_status()
+                        remote_hero = job_dir / "remote_hero.jpg"
+                        remote_hero.write_bytes(r.content)
+                        bg_images.append(remote_hero)
+                except Exception:
+                    pass
+        extra_images = await _collect_extra_images(job_dir, meta, limit=3)
+        for p in extra_images:
+            if p.exists():
+                bg_images.append(p)
+        web_images = await _collect_web_images(job_dir, meta, limit=3)
+        for p in web_images:
+            if p.exists():
+                bg_images.append(p)
     dedup: list[Path] = []
     seen: set[str] = set()
     for p in bg_images:
@@ -392,10 +399,11 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
         p = Path(str(s))
         if p.exists():
             web_clips.append(p)
-    extra_clips = await _collect_web_video_clips(job_dir, meta, limit=2, duration_sec=min(5.0, duration / 3.0))
-    for p in extra_clips:
-        if p.exists():
-            web_clips.append(p)
+    if not must_uploaded:
+        extra_clips = await _collect_web_video_clips(job_dir, meta, limit=2, duration_sec=min(5.0, duration / 3.0))
+        for p in extra_clips:
+            if p.exists():
+                web_clips.append(p)
     clip_dedup: list[Path] = []
     clip_seen: set[str] = set()
     for p in web_clips:
@@ -454,7 +462,7 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
                 "yuv420p",
                 str(part),
             ]
-            if web_clips and i in {1, 3}:
+            if web_clips and (prefer_video or i in {1, 3}):
                 clip = web_clips[(i - 1) % len(web_clips)]
                 cmd = [
                     "ffmpeg",

@@ -10,6 +10,13 @@ export interface JobOut {
   updated_at?: string | null
 }
 
+export interface SubtitleCue {
+  index?: number
+  start?: number
+  end?: number
+  text?: string
+}
+
 export interface JobDetailResponse {
   job: JobOut
   latest_script: Record<string, unknown> | null
@@ -22,4 +29,9 @@ export interface JobDetailResponse {
     meta_json?: Record<string, unknown> | null
   }>
   subtitle_timeline_id: number | null
+  news_title?: string | null
+  content_chars?: number | null
+  candidate_score_10?: number | null
+  candidate_tier?: string | null
+  subtitle_cues?: SubtitleCue[] | null
 }

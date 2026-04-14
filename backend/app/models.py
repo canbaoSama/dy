@@ -61,6 +61,8 @@ class NewsItem(Base):
     candidate_tier: Mapped[str] = mapped_column(String(32), default=CandidateTier.neutral.value)
     score_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # 各信源 RSS 每次抓取到该链接时刷新，用于「今日热点」排序（避免库里永远只按旧稿发布时间置顶）
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     source: Mapped[NewsSource] = relationship(back_populates="items")
     jobs: Mapped[list[VideoJob]] = relationship(back_populates="news_item")

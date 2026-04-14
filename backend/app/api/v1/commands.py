@@ -12,6 +12,7 @@ from app.schemas import CommandRequest, CommandResponse, JobOut
 from app.services.command_parser import parse_command
 from app.services.script_gen import rewrite_script_payload
 from app.services.candidate_list import query_candidate_rows, serialize_candidates
+from app.services.rss_ingest import ensure_default_sources
 
 from app.api.v1.jobs import _run_pipeline_bg
 
@@ -30,13 +31,24 @@ async def chat_command(
     await session.commit()
 
     if parsed["kind"] == "candidates":
+        # 每次查看候选前先对齐当前默认信源开关，避免看到历史旧来源
+        await ensure_default_sources(session)
         rows = await query_candidate_rows(session)
         items = await serialize_candidates(rows)
-        lines = [f"{x.index}. 【{x.source}】{x.title_zh or x.title}（{x.tier}）" for x in items[:15]]
-        reply = "今日候选（最多展示 15 条）：\n" + "\n".join(lines) if lines else "暂无候选，请先点击「抓取新闻」或调用 POST /ingest/trigger"
+        lines = [
+            f"{x.index}. 【{x.source}】{x.title_zh or x.title}（热度指数 {x.heat_index if x.heat_index is not None else '-'} · {x.tier}）"
+            for x in items[:15]
+        ]
+        reply = (
+            "今日全球热点候选（美东当天优先，仅统计当前启用来源；最多 15 条）：\n"
+            + "\n".join(lines)
+            if lines
+            else "暂无候选，请先点「抓取新闻」拉取默认热榜组合（Google News + Reuters + BBC + Google Trends + Reddit）。"
+        )
         return CommandResponse(reply=reply, candidates=items[:15])
 
     if parsed["kind"] == "make_job":
+        await ensure_default_sources(session)
         idx = int(parsed["index"])
         rows = await query_candidate_rows(session)
         if idx < 1 or idx > len(rows):

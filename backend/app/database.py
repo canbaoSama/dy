@@ -16,6 +16,15 @@ def _migrate_sqlite_video_jobs(sync_conn) -> None:
         sync_conn.exec_driver_sql("ALTER TABLE video_jobs ADD COLUMN failed_stage VARCHAR(48)")
 
 
+def _migrate_sqlite_news_items_last_seen(sync_conn) -> None:
+    if sync_conn.dialect.name != "sqlite":
+        return
+    r = sync_conn.exec_driver_sql("PRAGMA table_info(news_items)")
+    cols = [row[1] for row in r.fetchall()]
+    if cols and "last_seen_at" not in cols:
+        sync_conn.exec_driver_sql("ALTER TABLE news_items ADD COLUMN last_seen_at DATETIME")
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -43,3 +52,4 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_sqlite_video_jobs)
+        await conn.run_sync(_migrate_sqlite_news_items_last_seen)

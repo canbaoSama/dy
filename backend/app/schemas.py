@@ -12,6 +12,10 @@ class CandidateItem(BaseModel):
     title_zh: str | None = None
     source: str
     score_10: float | None = None
+    heat_index: int | None = None
+    source_weight: float | None = None
+    recency_score_10: float | None = None
+    rank_score_10: float | None = None
     published_at: datetime | None
     summary: str | None
     summary_zh: str | None = None
@@ -60,6 +64,12 @@ class JobDetailOut(BaseModel):
     audios: list[AudioOutputBrief] = []
     videos: list[VideoOutputBrief] = []
     subtitle_timeline_id: int | None = None
+    # 供前端对话里展示流水线细节（评分 / 字幕条等）
+    news_title: str | None = None
+    content_chars: int | None = None
+    candidate_score_10: float | None = None
+    candidate_tier: str | None = None
+    subtitle_cues: list[dict[str, Any]] | None = None
 
 
 class CommandRequest(BaseModel):

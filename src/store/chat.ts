@@ -3,7 +3,15 @@ import { v4 as uuidv4 } from 'uuid'
 import dayjs from 'dayjs'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
-import { createJobFromCandidate, postCommand, triggerIngest, triggerPipeline, uploadJobAssets, type CommandResponse } from '@/api/factory'
+import {
+  createJobFromCandidate,
+  postCommand,
+  triggerIngest,
+  triggerPipeline,
+  triggerRerender,
+  uploadJobAssets,
+  type CommandResponse,
+} from '@/api/factory'
 import type { ChatMessage } from '@/types/chat'
 
 interface ChatState {
@@ -56,24 +64,84 @@ export const useChatStore = defineStore('chat', {
       this.jobStatusMap[jobId] = status
     },
 
+    appendAssistantMessage(msg: ChatMessage) {
+      this.messages.push(msg)
+    },
+
+    /** 进入页面时拉取今日候选：只追加助手消息，不插入用户气泡 */
+    async bootstrapTodayCandidates() {
+      if (this.loading) return
+      this.loading = true
+      try {
+        const res = await postCommand('今日候选', this.activeJobId)
+        if (res.active_job_id != null) {
+          this.activeJobId = res.active_job_id
+        }
+        if (Array.isArray(res.candidates)) {
+          this.lastCandidates = res.candidates.length > 0 ? res.candidates : null
+        }
+        this.messages.push({
+          id: uuidv4(),
+          role: 'assistant',
+          content: res.reply,
+          createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+        })
+      } catch (e) {
+        ElMessage.warning(formatChatError(e))
+      } finally {
+        this.loading = false
+      }
+    },
+
     async runIngest() {
       this.ingestLoading = true
       try {
         const r = await triggerIngest()
         const failedCount = r.failed_count ?? 0
-        ElMessage.success(`抓取完成：新增 ${r.added} 条${failedCount ? `，失败 ${failedCount} 条` : ''}`)
+        const refreshed = r.refreshed ?? 0
+        ElMessage.success(
+          `抓取完成：新增 ${r.added} 条${refreshed ? `，热点刷新 ${refreshed} 条` : ''}${failedCount ? `，失败 ${failedCount} 条` : ''}`,
+        )
         const failHint =
           failedCount && r.failed?.length
             ? `\n失败源：${r.failed.slice(0, 3).map((x) => x.source).join(' / ')}`
             : ''
+        const hotHint =
+          r.hot_top?.length
+            ? `\n热度TOP：\n${r.hot_top
+                .slice(0, 5)
+                .map((x) => `${x.index}. 【${x.source}】${x.title}（热度指数 ${x.heat_index ?? '-'}）`)
+                .join('\n')}`
+            : ''
         this.messages.push({
           id: uuidv4(),
           role: 'assistant',
-          content: `抓取完成：新增 ${r.added} 条（信源 ${r.sources} 个）${
+          content: `抓取完成：新增 ${r.added} 条${refreshed ? `，热点刷新 ${refreshed} 条` : ''}（信源 ${r.sources} 个）${
             failedCount ? `，失败 ${failedCount} 条` : ''
-          }。可发送「今天候选」。${failHint}`,
+          }。正在同步今日候选…${hotHint}${failHint}`,
           createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
         })
+        if (Array.isArray(r.candidates)) {
+          this.lastCandidates = r.candidates.length > 0 ? r.candidates : null
+          const lines = r.candidates
+            .slice(0, 15)
+            .map((x, i) => `${i + 1}. 【${x.source}】${x.title_zh || x.title}（热度指数 ${x.heat_index ?? '-'} · ${x.tier}）`)
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: lines.length
+              ? `今日全球热点候选（抓取后自动更新）：\n${lines.join('\n')}`
+              : '今日候选为空，请稍后重试抓取。',
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+          })
+        } else {
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: '抓取已完成，但候选列表返回为空，请稍后重试。',
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+          })
+        }
       } catch (e) {
         ElMessage.error(formatChatError(e))
       } finally {
@@ -94,11 +162,25 @@ export const useChatStore = defineStore('chat', {
 
       this.loading = true
       try {
+        if (this.activeJobId != null && /^重新生成|^重生成/.test(text)) {
+          const instruction = text.replace(/^重新生成|^重生成/, '').trim()
+          await triggerRerender(this.activeJobId, { instruction })
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: `已按新需求重生成任务 #${this.activeJobId}，请稍候查看最新成片。`,
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+          })
+          return
+        }
         const res = await postCommand(text, this.activeJobId)
         if (res.active_job_id != null) {
           this.activeJobId = res.active_job_id
         }
-        this.lastCandidates = res.candidates?.length ? res.candidates : this.lastCandidates
+        // 必须用 Array.isArray：否则 candidates: [] 时?.length 为假，会错误保留旧的英文列表
+        if (Array.isArray(res.candidates)) {
+          this.lastCandidates = res.candidates.length > 0 ? res.candidates : null
+        }
         this.messages.push({
           id: uuidv4(),
           role: 'assistant',
@@ -156,6 +238,35 @@ export const useChatStore = defineStore('chat', {
           id: uuidv4(),
           role: 'assistant',
           content: `已上传 ${r.added} 个素材到任务 #${this.activeJobId}，可直接重新点“渲染”或触发流水线。`,
+          createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+        })
+      } catch (e) {
+        ElMessage.error(formatChatError(e))
+      } finally {
+        this.loading = false
+      }
+    },
+
+    async rerenderActiveJob(payload: {
+      instruction?: string
+      duration_sec?: number
+      style_notes?: string
+      must_use_uploaded_assets?: boolean
+      prefer_video_assets?: boolean
+      subtitle_tone?: string
+      tts_voice?: string
+    }) {
+      if (this.activeJobId == null) {
+        ElMessage.warning('请先选择任务')
+        return
+      }
+      this.loading = true
+      try {
+        await triggerRerender(this.activeJobId, payload)
+        this.messages.push({
+          id: uuidv4(),
+          role: 'assistant',
+          content: `已按配置重生成任务 #${this.activeJobId}，请稍候查看最新视频。`,
           createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
         })
       } catch (e) {

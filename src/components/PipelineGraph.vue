@@ -12,17 +12,21 @@ const states = computed(() => computeStageStates(props.status, props.failedStage
 function stageWrapClass(s: StageVisualState) {
   return `wrap-${s}`
 }
+
+function stAt(i: number): StageVisualState {
+  return states.value[i] ?? 'pending'
+}
 </script>
 
 <template>
   <div class="pipeline-root" role="list" aria-label="生产流水线">
     <div class="pipeline-list">
       <template v-for="(st, i) in PIPELINE_STAGES" :key="st.key">
-        <div class="stage-row" :class="stageWrapClass(states[i]!)">
+        <div class="stage-row" :class="stageWrapClass(stAt(i))">
           <div class="node" :title="st.key">
             <!-- pending -->
             <svg
-              v-if="states[i] === 'pending'"
+              v-if="stAt(i) === 'pending'"
               class="ico"
               viewBox="0 0 24 24"
               fill="none"
@@ -33,7 +37,7 @@ function stageWrapClass(s: StageVisualState) {
             </svg>
             <!-- running -->
             <svg
-              v-else-if="states[i] === 'running'"
+              v-else-if="stAt(i) === 'running'"
               class="ico ico-spin"
               viewBox="0 0 24 24"
               fill="none"
@@ -44,7 +48,7 @@ function stageWrapClass(s: StageVisualState) {
             </svg>
             <!-- success -->
             <svg
-              v-else-if="states[i] === 'success'"
+              v-else-if="stAt(i) === 'success'"
               class="ico"
               viewBox="0 0 24 24"
               fill="none"
@@ -56,7 +60,7 @@ function stageWrapClass(s: StageVisualState) {
             </svg>
             <!-- failed -->
             <svg
-              v-else-if="states[i] === 'failed'"
+              v-else-if="stAt(i) === 'failed'"
               class="ico"
               viewBox="0 0 24 24"
               fill="none"
@@ -93,17 +97,8 @@ function stageWrapClass(s: StageVisualState) {
 
 .pipeline-list {
   padding: 10px 12px;
-  max-height: 360px;
-  overflow-y: auto;
-}
-
-.pipeline-list::-webkit-scrollbar {
-  width: 8px;
-}
-
-.pipeline-list::-webkit-scrollbar-thumb {
-  background: #c9d1d9;
-  border-radius: 99px;
+  max-height: none;
+  overflow: visible;
 }
 
 .stage-row {
