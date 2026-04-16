@@ -245,6 +245,27 @@ export const useChatStore = defineStore('chat', {
 
       this.loading = true
       try {
+        const editMatch = text.match(/^(改标题|改简介|改字幕|改素材)[:：\s]+(.+)$/)
+        if (this.activeJobId != null && editMatch) {
+          const map: Record<string, string> = {
+            改标题: '标题',
+            改简介: '简介',
+            改字幕: '字幕',
+            改素材: '素材',
+          }
+          const field = map[editMatch[1]] || editMatch[1]
+          const value = editMatch[2].trim()
+          await triggerRerender(this.activeJobId, {
+            instruction: `请仅调整${field}，要求：${value}`,
+          })
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: `已记录${field}修改并触发重生成任务 #${this.activeJobId}，请稍候查看最新结果。`,
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+          })
+          return
+        }
         if (this.activeJobId != null && /^重新生成|^重生成/.test(text)) {
           const instruction = text.replace(/^重新生成|^重生成/, '').trim()
           await triggerRerender(this.activeJobId, { instruction })

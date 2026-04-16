@@ -32,6 +32,10 @@ const rerenderForm = reactive({
   tts_voice: 'zh-CN-XiaoxiaoNeural',
   must_use_uploaded_assets: false,
   prefer_video_assets: true,
+  title_edit: '',
+  intro_edit: '',
+  subtitle_edit: '',
+  material_edit: '',
 })
 
 const canSend = computed(() => input.value.trim().length > 0 && !chatStore.loading)
@@ -600,7 +604,16 @@ function bumpRerenderDuration(delta: number) {
 }
 
 async function onRerenderWithConfig() {
+  const customRules = [
+    rerenderForm.title_edit.trim() ? `标题：${rerenderForm.title_edit.trim()}` : '',
+    rerenderForm.intro_edit.trim() ? `简介：${rerenderForm.intro_edit.trim()}` : '',
+    rerenderForm.subtitle_edit.trim() ? `字幕风格：${rerenderForm.subtitle_edit.trim()}` : '',
+    rerenderForm.material_edit.trim() ? `素材要求：${rerenderForm.material_edit.trim()}` : '',
+  ]
+    .filter(Boolean)
+    .join('；')
   await chatStore.rerenderActiveJob({
+    instruction: customRules ? `请按以下要求重生成并严格执行：${customRules}` : undefined,
     duration_sec: rerenderForm.duration_sec,
     subtitle_tone: rerenderForm.subtitle_tone,
     tts_voice: rerenderForm.tts_voice,
@@ -757,6 +770,12 @@ function tierClass(tier: string) {
                   <span class="rerender-lbl rerender-lbl-wide" title="关闭则优先静态图">优先视频</span>
                   <el-switch v-model="rerenderForm.prefer_video_assets" size="small" />
                 </div>
+              </div>
+              <div class="rerender-edit-grid">
+                <el-input v-model="rerenderForm.title_edit" size="small" placeholder="改标题：例如 更抓眼、20字内" clearable />
+                <el-input v-model="rerenderForm.intro_edit" size="small" placeholder="改简介：例如 强调冲突与结果" clearable />
+                <el-input v-model="rerenderForm.subtitle_edit" size="small" placeholder="改字幕：例如 更口语、更短句" clearable />
+                <el-input v-model="rerenderForm.material_edit" size="small" placeholder="改素材：例如 多人物近景，减少Logo" clearable />
               </div>
               <el-button
                 class="btn-green rerender-submit-btn"
@@ -1048,7 +1067,7 @@ function tierClass(tier: string) {
                 class="composer-input"
                 type="textarea"
                 :rows="3"
-                placeholder="给我指令，Enter 发送，Shift+Enter 换行"
+                placeholder="可直接发：改标题/改简介/改字幕/改素材 + 需求；Enter 发送，Shift+Enter 换行"
                 resize="none"
                 @keydown.enter="onInputEnter"
               />
@@ -1185,9 +1204,9 @@ function tierClass(tier: string) {
 
 .rerender-bar {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -1323,6 +1342,13 @@ function tierClass(tier: string) {
   font-weight: 800;
   align-self: center;
   margin-left: 4px;
+}
+
+.rerender-edit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 6px;
+  width: 100%;
 }
 
 .rerender-item :deep(.el-switch) {
