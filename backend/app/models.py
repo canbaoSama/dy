@@ -18,6 +18,7 @@ class JobStatus(str, enum.Enum):
     scoring_candidate = "scoring_candidate"
     generating_script = "generating_script"
     collecting_assets = "collecting_assets"
+    generating_subtitles = "generating_subtitles"
     generating_audio = "generating_audio"
     building_timeline = "building_timeline"
     rendering_video = "rendering_video"

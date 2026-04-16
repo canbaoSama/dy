@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from datetime import datetime, timezone
@@ -64,19 +65,51 @@ async def ensure_default_sources(session: AsyncSession) -> list[NewsSource]:
 
 async def fetch_and_store_feed(session: AsyncSession, source: NewsSource, limit: int = 30) -> tuple[int, int]:
     """拉取 RSS 并入库。返回 (新增条数, 已存在但刷新 last_seen_at 的条数)。"""
-    client_kwargs: dict[str, object] = {"timeout": 30.0, "follow_redirects": True}
+    timeout = max(float(settings.rss_fetch_timeout_seconds or 10.0), 1.0)
+    retries = max(int(settings.rss_fetch_retry_count or 0), 0)
+    client_kwargs: dict[str, object] = {
+        "timeout": httpx.Timeout(timeout=timeout, connect=min(timeout, 5.0)),
+        "follow_redirects": True,
+        # 避免被系统 HTTP(S)_PROXY 污染导致统一 DNS 失败；
+        # 仅在显式配置 RSS_PROXY_URL 时启用代理。
+        "trust_env": False,
+    }
     proxy = (settings.rss_proxy_url or "").strip()
     if proxy:
         client_kwargs["proxy"] = proxy
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0 OverseasNewsFactory/1.0",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
+    }
+    last_error: Exception | None = None
+    raw = ""
     async with httpx.AsyncClient(**client_kwargs) as client:
-        r = await client.get(
-            source.rss_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0 OverseasNewsFactory/1.0"
-            },
-        )
-        r.raise_for_status()
-        raw = r.text
+        for attempt in range(retries + 1):
+            try:
+                r = await client.get(source.rss_url, headers=headers)
+                if r.status_code == 429 and attempt < retries:
+                    await asyncio.sleep(1.5)
+                    continue
+                r.raise_for_status()
+                raw = r.text
+                break
+            except httpx.HTTPError as e:
+                last_error = e
+                if attempt < retries:
+                    await asyncio.sleep(0.8)
+                    continue
+                msg = str(e) or repr(e)
+                if "Temporary failure in name resolution" in msg:
+                    raise RuntimeError(
+                        "域名解析失败，请检查网络/DNS，或在 backend/.env 设置 RSS_PROXY_URL（如 http://127.0.0.1:7890）"
+                    ) from e
+                if isinstance(e, httpx.ConnectTimeout | httpx.ReadTimeout):
+                    raise RuntimeError(
+                        f"抓取超时（{timeout:.1f}s），可在 backend/.env 调大 RSS_FETCH_TIMEOUT_SECONDS"
+                    ) from e
+                raise
+    if not raw and last_error:
+        raise last_error
 
     parsed = feedparser.parse(raw)
     added = 0

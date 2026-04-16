@@ -8,6 +8,15 @@ from typing import Any, Literal
 ParsedKind = Literal[
     "candidates",
     "make_job",
+    "asset_candidates",
+    "select_assets",
+    "step_subtitle_draft",
+    "step_script",
+    "step_timeline",
+    "step_audio",
+    "step_render",
+    "confirm_subtitles",
+    "confirm_audio",
     "rewrite_script",
     "render",
     "titles",
@@ -21,12 +30,35 @@ def parse_command(text: str) -> dict[str, Any]:
     if not t:
         return {"kind": "unknown", "raw": text}
 
-    if re.search(r"(今天|今日)?\s*候选|给我.*新闻|候选列表", t, re.I):
-        return {"kind": "candidates", "raw": text}
-
     m = re.search(r"做\s*第\s*(\d+)\s*条", t)
     if m:
         return {"kind": "make_job", "index": int(m.group(1)), "raw": text}
+
+    if re.search(r"素材候选|候选素材|素材列表|给我素材", t, re.I):
+        return {"kind": "asset_candidates", "raw": text}
+    m = re.search(r"选素材\s*([0-9,\s，]+)", t, re.I)
+    if m:
+        raw = m.group(1)
+        nums = [int(x) for x in re.findall(r"\d+", raw)]
+        return {"kind": "select_assets", "indices": nums, "raw": text}
+
+    if re.search(r"生成字幕|字幕草稿|字幕步骤|步骤1", t, re.I):
+        return {"kind": "step_subtitle_draft", "raw": text}
+    if re.search(r"生成脚本|脚本步骤|步骤2", t, re.I):
+        return {"kind": "step_script", "raw": text}
+    if re.search(r"字幕时间轴|时间轴|步骤3", t, re.I):
+        return {"kind": "step_timeline", "raw": text}
+    if re.search(r"确认字幕|字幕确认|继续音频", t, re.I):
+        return {"kind": "confirm_subtitles", "raw": text}
+    if re.search(r"生成音频|音频步骤|步骤4", t, re.I):
+        return {"kind": "step_audio", "raw": text}
+    if re.search(r"确认音频|音频确认|继续合成", t, re.I):
+        return {"kind": "confirm_audio", "raw": text}
+    if re.search(r"合成视频|渲染视频|步骤4", t, re.I):
+        return {"kind": "step_render", "raw": text}
+
+    if re.search(r"(今天|今日)?\s*候选|给我.*新闻|候选列表", t, re.I):
+        return {"kind": "candidates", "raw": text}
 
     m = re.search(r"开始渲染|渲染\s*(\d+)?", t)
     if m:

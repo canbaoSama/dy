@@ -29,12 +29,47 @@ export interface CommandResponse {
   job?: { id: number; status: string }
 }
 
+export interface CandidateLite {
+  index: number
+  title: string
+  title_zh?: string | null
+  source: string
+  published_at: string | null
+  summary: string | null
+  summary_zh?: string | null
+  tier: string
+  url: string
+  score_10?: number | null
+  heat_index?: number | null
+  source_weight?: number | null
+  recency_score_10?: number | null
+  rank_score_10?: number | null
+}
+
 export async function postCommand(message: string, activeJobId: number | null): Promise<CommandResponse> {
   const { data } = await client.post<CommandResponse>('/commands', {
     message,
     active_job_id: activeJobId,
   })
   return data
+}
+
+export async function translateCandidatesToZh(
+  items: CandidateLite[],
+): Promise<Array<{ index: number; url: string; title_zh: string; summary_zh: string }>> {
+  const { data } = await client.post<{ items: Array<{ index: number; url: string; title_zh: string; summary_zh: string }> }>(
+    '/candidates/translate',
+    {
+      items: items.map((x) => ({
+        index: x.index,
+        title: x.title_zh || x.title,
+        summary: x.summary_zh || x.summary,
+        source: x.source,
+        url: x.url,
+      })),
+    },
+  )
+  return data.items || []
 }
 
 export async function triggerIngest(): Promise<{
@@ -112,5 +147,30 @@ export async function uploadJobAssets(
     form,
     { headers: { 'Content-Type': 'multipart/form-data' } },
   )
+  return data
+}
+
+export async function fetchJobAssetCandidates(
+  jobId: number,
+): Promise<{ job_id: number; article_url: string; items: Array<{ url: string; asset_type: string; source?: string }> }> {
+  const { data } = await client.get<{ job_id: number; article_url: string; items: Array<{ url: string; asset_type: string; source?: string }> }>(
+    `/jobs/${jobId}/asset-candidates`,
+  )
+  return data
+}
+
+export async function pickRemoteAssets(
+  jobId: number,
+  items: Array<{ url: string; asset_type?: string }>,
+): Promise<{ ok: boolean; job_id: number; added: number }> {
+  const { data } = await client.post<{ ok: boolean; job_id: number; added: number }>(`/jobs/${jobId}/assets/select-remote`, { items })
+  return data
+}
+
+export async function updateLatestSubtitles(
+  jobId: number,
+  cues: Array<{ start: number; end: number; text: string }>,
+): Promise<{ ok: boolean; job_id: number; count: number }> {
+  const { data } = await client.put<{ ok: boolean; job_id: number; count: number }>(`/jobs/${jobId}/subtitles/latest`, { cues })
   return data
 }

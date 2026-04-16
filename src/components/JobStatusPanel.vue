@@ -18,19 +18,6 @@ let timer: ReturnType<typeof setInterval> | null = null
 const TERMINAL = new Set(['ready_for_review', 'approved', 'failed'])
 
 const jobStatus = computed(() => detail.value?.job.status ?? 'created')
-const latestVideoUrl = computed(() => {
-  if (!props.jobId) return ''
-  const hasVideo = (detail.value?.videos?.length || 0) > 0
-  if (!hasVideo) return ''
-  return `${import.meta.env.VITE_API_BASE || '/api/v1'}/jobs/${props.jobId}/video/latest?t=${Date.now()}`
-})
-const latestDownloadUrl = computed(() => {
-  if (!props.jobId) return ''
-  const hasVideo = (detail.value?.videos?.length || 0) > 0
-  if (!hasVideo) return ''
-  return `${import.meta.env.VITE_API_BASE || '/api/v1'}/jobs/${props.jobId}/video/latest/download`
-})
-
 async function load() {
   if (props.jobId == null) {
     detail.value = null
@@ -123,23 +110,17 @@ onBeforeUnmount(() => clearTimer())
     </div>
     <div v-else-if="!err" class="banner banner-muted">正在加载流水线…</div>
 
-    <div v-if="latestVideoUrl" class="video-wrap">
-      <div class="video-head">
-        <span>最新成片预览</span>
-        <a class="download-link" :href="latestDownloadUrl" download>下载视频</a>
-      </div>
-      <video class="video" :src="latestVideoUrl" controls preload="metadata" />
-      <div class="video-link">{{ latestVideoUrl }}</div>
-    </div>
   </div>
 </template>
 
 <style scoped>
 .panel {
-  padding: 0 0 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 0 0 10px;
   background: transparent;
   min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .panel-head {
@@ -224,7 +205,8 @@ onBeforeUnmount(() => clearTimer())
 
 .pipeline-wrap {
   margin: 0 16px;
-  max-height: 220px;
+  min-height: 0;
+  height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -238,50 +220,4 @@ onBeforeUnmount(() => clearTimer())
   border-radius: 99px;
 }
 
-.video-wrap {
-  margin: 12px 16px 0;
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  background: rgba(15, 23, 42, 0.55);
-  border-radius: 8px;
-  padding: 10px;
-}
-
-.video-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 12px;
-  font-weight: 700;
-  color: #f8fafc;
-  margin-bottom: 8px;
-}
-
-.download-link {
-  font-size: 12px;
-  color: #93c5fd;
-  text-decoration: none;
-}
-
-.download-link:hover {
-  text-decoration: underline;
-}
-
-.video {
-  width: 100%;
-  max-height: 680px;
-  min-height: 420px;
-  aspect-ratio: 9 / 16;
-  object-fit: contain;
-  background: #000;
-  border-radius: 6px;
-}
-
-.video-link {
-  margin-top: 6px;
-  font-size: 11px;
-  color: #94a3b8;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 </style>

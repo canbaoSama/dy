@@ -40,6 +40,9 @@ class Settings(BaseSettings):
 
     # 出网代理（用于 RSS 抓取）；示例：http://127.0.0.1:7890
     rss_proxy_url: str | None = None
+    rss_fetch_timeout_seconds: float = 10.0
+    rss_fetch_retry_count: int = 1
+    job_stuck_recover_minutes: int = 8
 
 
 settings = Settings()

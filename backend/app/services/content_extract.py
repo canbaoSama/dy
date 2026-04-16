@@ -44,6 +44,32 @@ _IMG_RE = re.compile(
     re.I,
 )
 _FIRST_IMG_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.I)
+_VIDEO_META_RE = re.compile(
+    r'<meta[^>]+property=["\'](?:og:video|og:video:url|twitter:player:stream)["\'][^>]+content=["\']([^"\']+)["\']',
+    re.I,
+)
+_VIDEO_TAG_RE = re.compile(r'<video[^>]+src=["\']([^"\']+)["\']', re.I)
+_VIDEO_SOURCE_RE = re.compile(r'<source[^>]+src=["\']([^"\']+)["\']', re.I)
+_VIDEO_URL_RE = re.compile(r'https?:\/\/[^\s"\'<>]+(?:\.m3u8|\.mp4|\.webm)[^\s"\'<>]*', re.I)
+
+
+def _looks_like_noise_asset(url: str) -> bool:
+    low = (url or "").lower()
+    bad_words = (
+        "share_icon",
+        "icon/",
+        "/icons/",
+        "logo",
+        "qrcode",
+        "wechat",
+        "weibo",
+        "facebook",
+        "twitter",
+        "attention.jpg",
+        "about-news",
+        "gwab",
+    )
+    return any(w in low for w in bad_words)
 
 
 def _guess_hero_image(html: str, base_url: str) -> str | None:
@@ -57,3 +83,63 @@ def _guess_hero_image(html: str, base_url: str) -> str | None:
         if candidate.lower().startswith(("http://", "https://")):
             return candidate
     return None
+
+
+def extract_media_candidates_from_html(
+    html: str,
+    base_url: str,
+    *,
+    max_images: int = 16,
+    max_videos: int = 8,
+) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+
+    def push(url: str, asset_type: str, source: str) -> None:
+        u = urljoin(base_url, (url or "").strip())
+        if not u.startswith(("http://", "https://")):
+            return
+        if _looks_like_noise_asset(u):
+            return
+        if u in seen:
+            return
+        seen.add(u)
+        out.append({"url": u, "asset_type": asset_type, "source": source})
+
+    for m in _IMG_RE.finditer(html):
+        push(m.group(1), "user_image", "og:image")
+        if sum(1 for x in out if x["asset_type"] == "user_image") >= max_images:
+            break
+    if sum(1 for x in out if x["asset_type"] == "user_image") < max_images:
+        for m in _FIRST_IMG_RE.finditer(html):
+            push(m.group(1), "user_image", "img")
+            if sum(1 for x in out if x["asset_type"] == "user_image") >= max_images:
+                break
+
+    for pattern in (_VIDEO_META_RE, _VIDEO_TAG_RE, _VIDEO_SOURCE_RE):
+        for m in pattern.finditer(html):
+            push(m.group(1), "user_video", "video")
+            if sum(1 for x in out if x["asset_type"] == "user_video") >= max_videos:
+                break
+        if sum(1 for x in out if x["asset_type"] == "user_video") >= max_videos:
+            break
+    if sum(1 for x in out if x["asset_type"] == "user_video") < max_videos:
+        for m in _VIDEO_URL_RE.finditer(html):
+            push(m.group(0), "user_video", "video_url")
+            if sum(1 for x in out if x["asset_type"] == "user_video") >= max_videos:
+                break
+
+    return out
+
+
+async def fetch_media_candidates(article_url: str) -> list[dict[str, str]]:
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+        r = await client.get(
+            article_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; NewsFactory/0.1)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        r.raise_for_status()
+    return extract_media_candidates_from_html(r.text, str(r.url))

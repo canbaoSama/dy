@@ -7,9 +7,33 @@ from typing import Optional
 from app.config import settings
 
 _ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+# 有道 jsonapi_s：「number + 序号」易误走词典；半角数字整句也不稳定 → 归一成「# 序号」+ 无 URL 时全角数字
+_NUM_WORD_DIGIT = re.compile(r"(?i)\bnumber\s+(\d+)")
+_NO_ABBREV_DIGIT = re.compile(r"(?i)\bno\.\s*(\d+)")
 
-# 并发翻译时限制出站连接，避免公共接口限流
-_translate_sem = asyncio.Semaphore(8)
+# 并发翻译时限制出站连接；数值过大时有道等接口容易偶发空结果/英文回退
+_translate_sem = asyncio.Semaphore(5)
+
+
+def _ascii_digits_to_fullwidth(s: str) -> str:
+    return "".join(chr(ord(c) - ord("0") + 0xFF10) if "0" <= c <= "9" else c for c in s)
+
+
+def _normalize_for_third_party_translate(s: str) -> str:
+    """
+    将用于调用公共翻译接口的文本做轻量归一化：
+    - 「number 25 / No.5」→「# 25」类写法，避免有道把 number 当词典关键词；
+    - 无 URL 时再将剩余半角数字改为全角，进一步降低整句 fanyi 失败率；
+    - 含 URL 时不做全角化，避免破坏链接；上述 # 替换仍尽量只影响英文标题句式。
+    """
+    t = (s or "").strip()
+    if not t:
+        return t
+    t = _NUM_WORD_DIGIT.sub(lambda m: "# " + m.group(1), t)
+    t = _NO_ABBREV_DIGIT.sub(lambda m: "# " + m.group(1), t)
+    if "://" not in t:
+        return _ascii_digits_to_fullwidth(t)
+    return t
 
 
 def _has_zh(text: str) -> bool:
@@ -22,9 +46,24 @@ def _mymemory_out_valid(q: str, out: str) -> bool:
     u = out.upper()
     if "INVALID SOURCE LANGUAGE" in u or "QUERY LENGTH LIMIT" in u:
         return False
+    if "MYMEMORY WARNING" in u or "QUERY TOO LONG" in u or "USAGE LIMITS" in u:
+        return False
     if out.strip().lower() == q.strip().lower():
         return False
+    # 英译中：合法结果应含中文，避免把额度提示等英文当作译文
+    if not _has_zh(out):
+        return False
     return True
+
+
+def _looks_like_valid_zh_translation(src: str, out: str) -> bool:
+    """公共接口偶发返回原文/非中文；用于过滤后再尝试下一供应商。"""
+    o = (out or "").strip()
+    if not o:
+        return False
+    if o.casefold() == (src or "").strip().casefold():
+        return False
+    return _has_zh(o)
 
 
 async def _translate_youdao(raw: str) -> Optional[str]:
@@ -39,7 +78,10 @@ async def _translate_youdao(raw: str) -> Optional[str]:
             r = await client.get(
                 "https://dict.youdao.com/jsonapi_s",
                 params={"q": q, "doctype": "json", "jsonversion": "4"},
-                headers={"User-Agent": "Mozilla/5.0 (compatible; overseas-news-factory/1.0)"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://fanyi.youdao.com/",
+                },
             )
             r.raise_for_status()
             data = r.json()
@@ -107,7 +149,7 @@ async def _translate_google(raw: str) -> Optional[str]:
                     if isinstance(row, list) and row and isinstance(row[0], str):
                         parts.append(row[0])
                 out = "".join(parts).strip()
-                if out:
+                if out and _looks_like_valid_zh_translation(q, out):
                     return out
     except Exception:
         pass
@@ -130,7 +172,9 @@ async def _translate_openai(raw: str) -> Optional[str]:
             temperature=0.1,
         )
         out = (resp.choices[0].message.content or "").strip()
-        return out or None
+        if out and _looks_like_valid_zh_translation(raw, out):
+            return out
+        return None
     except Exception:
         return None
 
@@ -140,7 +184,7 @@ async def _translate_plain_no_zh_check(raw: str) -> str:
     async with _translate_sem:
         for fn in (_translate_youdao, _translate_mymemory, _translate_google, _translate_openai):
             out = await fn(raw)
-            if out:
+            if out and _looks_like_valid_zh_translation(raw, out):
                 return out
     return raw
 
@@ -151,17 +195,34 @@ async def translate_to_zh(text: str) -> str:
         return ""
     if _has_zh(raw):
         return raw
+
+    work = _normalize_for_third_party_translate(raw)
+
+    async def _short_once() -> str:
+        return await _translate_plain_no_zh_check(work)
+
+    async def _chunked_once() -> str:
+        parts: list[str] = []
+        step = 400
+        for i in range(0, len(work), step):
+            chunk = work[i : i + step].strip()
+            if not chunk:
+                continue
+            if _has_zh(chunk):
+                parts.append(chunk)
+            else:
+                parts.append(await _translate_plain_no_zh_check(chunk))
+        return "".join(parts)
+
     # MyMemory 单次 query 不宜过长，分段翻译再拼接
-    if len(raw) <= 450:
-        return await _translate_plain_no_zh_check(raw)
-    parts: list[str] = []
-    step = 400
-    for i in range(0, len(raw), step):
-        chunk = raw[i : i + step].strip()
-        if not chunk:
-            continue
-        if _has_zh(chunk):
-            parts.append(chunk)
+    out = ""
+    for attempt in range(3):
+        if len(work) <= 450:
+            out = await _short_once()
         else:
-            parts.append(await _translate_plain_no_zh_check(chunk))
-    return "".join(parts)
+            out = await _chunked_once()
+        if _has_zh(out):
+            return out
+        if attempt < 2:
+            await asyncio.sleep(0.2 + 0.2 * attempt)
+    return out

@@ -17,13 +17,18 @@ def _escape_drawtext(text: str) -> str:
     return s
 
 
-async def _run_ffmpeg(args: list[str]) -> None:
+async def _run_ffmpeg(args: list[str], timeout_sec: float = 70.0) -> None:
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, err = await proc.communicate()
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError(f"ffmpeg timeout after {timeout_sec:.0f}s")
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {err.decode('utf-8', errors='ignore')[:500]}")
 
@@ -46,6 +51,13 @@ def _build_segments(script: dict) -> list[str]:
 
 
 _IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.I)
+_VIDEO_META_RE = re.compile(
+    r'<meta[^>]+property=["\'](?:og:video|og:video:url|twitter:player:stream)["\'][^>]+content=["\']([^"\']+)["\']',
+    re.I,
+)
+_VIDEO_TAG_RE = re.compile(r'<video[^>]+src=["\']([^"\']+)["\']', re.I)
+_VIDEO_SOURCE_RE = re.compile(r'<source[^>]+src=["\']([^"\']+)["\']', re.I)
+_VIDEO_URL_RE = re.compile(r'https?:\/\/[^\s"\'<>]+(?:\.m3u8|\.mp4|\.webm)[^\s"\'<>]*', re.I)
 
 
 def _pick_background_image(job_dir: Path, meta: dict) -> Path | None:
@@ -117,6 +129,35 @@ async def _collect_extra_images(job_dir: Path, meta: dict, limit: int = 3) -> li
                 out.append(p)
         except Exception:
             continue
+    return out
+
+
+async def _create_fallback_carousel_slides(job_dir: Path, count: int) -> list[Path]:
+    """无新闻图/视频时：用 ffmpeg lavfi 生成多帧竖版纯色底图，配合分段渲染形成轮播观感。"""
+    n = max(1, min(int(count), 6))
+    # 相邻帧略有色差，轮播时不至于完全「死灰一块」
+    hex_colors = ("0x171a1f", "0x1e232a", "0x262d36", "0x2e3640", "0x363e4a", "0x3e4755")
+    out: list[Path] = []
+    for i in range(n):
+        c = hex_colors[i % len(hex_colors)]
+        p = job_dir / f"fallback_carousel_{i}.jpg"
+        await _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={c}:s=720x1280:r=30",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                str(p),
+            ]
+        )
+        if p.exists():
+            out.append(p)
     return out
 
 
@@ -290,6 +331,85 @@ async def _collect_web_video_clips(job_dir: Path, meta: dict, limit: int = 2, du
     return out
 
 
+async def _collect_article_video_clips(job_dir: Path, meta: dict, limit: int = 2, duration_sec: float = 4.0) -> list[Path]:
+    """从新闻正文页提取视频链接并转码为竖屏片段。"""
+    article_url = str(meta.get("article_url") or "").strip()
+    if not article_url:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.get(
+                article_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            r.raise_for_status()
+            html = r.text
+    except Exception:
+        return []
+
+    urls: list[str] = []
+    for pattern in (_VIDEO_META_RE, _VIDEO_TAG_RE, _VIDEO_SOURCE_RE):
+        for m in pattern.finditer(html):
+            raw = m.group(1).strip()
+            if not raw:
+                continue
+            full = urljoin(article_url, raw)
+            low = full.lower()
+            if not low.startswith(("http://", "https://")):
+                continue
+            if not any(k in low for k in (".mp4", ".m3u8", ".webm", "playlist", "manifest")):
+                continue
+            if full not in urls:
+                urls.append(full)
+            if len(urls) >= limit * 2:
+                break
+        if len(urls) >= limit * 2:
+            break
+    if len(urls) < limit:
+        for m in _VIDEO_URL_RE.finditer(html):
+            u = m.group(0).strip()
+            low = u.lower()
+            if not low.startswith(("http://", "https://")):
+                continue
+            if u not in urls:
+                urls.append(u)
+            if len(urls) >= limit * 2:
+                break
+
+    out: list[Path] = []
+    for i, u in enumerate(urls[: limit * 2]):
+        p = job_dir / f"article_clip_{i}.mp4"
+        try:
+            await _run_ffmpeg(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    "0",
+                    "-i",
+                    u,
+                    "-t",
+                    f"{max(2.0, min(duration_sec, 6.0)):.2f}",
+                    "-an",
+                    "-vf",
+                    "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,format=yuv420p",
+                    "-r",
+                    "30",
+                    str(p),
+                ]
+            )
+            if p.exists():
+                out.append(p)
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
+
 def _split_subtitles(meta: dict) -> list[str]:
     narration_text = str(meta.get("narration_text") or "").strip()
     if narration_text:
@@ -325,8 +445,8 @@ def _build_subtitle_draws(lines: list[str], total_duration: float, font_path: st
             "drawtext="
             f"fontfile={font_path}:"
             f"text='{text}':"
-            "x=(w-text_w)/2:y=h-120:"
-            "fontsize=38:fontcolor=white:borderw=2:bordercolor=black@0.88:"
+            "x=(w-text_w)/2:y=h-162:"
+            "fontsize=52:fontcolor=white:borderw=4:bordercolor=black@0.95:shadowx=2:shadowy=2:shadowcolor=black@0.65:"
             f"enable='between(t,{start:.2f},{end:.2f})'"
         )
     return filters
@@ -376,14 +496,6 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
                         bg_images.append(remote_hero)
                 except Exception:
                     pass
-        extra_images = await _collect_extra_images(job_dir, meta, limit=3)
-        for p in extra_images:
-            if p.exists():
-                bg_images.append(p)
-        web_images = await _collect_web_images(job_dir, meta, limit=3)
-        for p in web_images:
-            if p.exists():
-                bg_images.append(p)
     dedup: list[Path] = []
     seen: set[str] = set()
     for p in bg_images:
@@ -394,26 +506,31 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
     bg_images = dedup[:4]
     if len(bg_images) > 4:
         bg_images = bg_images[:4]
-    web_clips: list[Path] = []
+    web_clips: list[str] = []
     for s in list(meta.get("user_video_paths") or []):
         p = Path(str(s))
         if p.exists():
-            web_clips.append(p)
-    if not must_uploaded:
-        extra_clips = await _collect_web_video_clips(job_dir, meta, limit=2, duration_sec=min(5.0, duration / 3.0))
-        for p in extra_clips:
-            if p.exists():
-                web_clips.append(p)
-    clip_dedup: list[Path] = []
+            web_clips.append(str(p))
+    for u in list(meta.get("user_video_urls") or []):
+        s = str(u or "").strip()
+        if s.startswith(("http://", "https://")):
+            web_clips.append(s)
+    clip_dedup: list[str] = []
     clip_seen: set[str] = set()
     for p in web_clips:
-        k = str(p.resolve())
+        k = p
         if k not in clip_seen:
             clip_seen.add(k)
             clip_dedup.append(p)
     web_clips = clip_dedup[:3]
     if not bg_images and not web_clips:
-        raise RuntimeError("未获取到相关新闻素材，已停止渲染（禁用画布兜底）")
+        if must_uploaded:
+            raise RuntimeError("已开启「仅已上传」，但未检测到可用的图片或视频素材，已停止渲染。")
+        # 画布兜底：多帧竖版占位图 + 字幕分段，等价于无图时的「轮播底」
+        slide_count = max(len(subtitle_lines), 3)
+        bg_images = await _create_fallback_carousel_slides(job_dir, slide_count)
+        if not bg_images:
+            raise RuntimeError("未获取到新闻素材，且无法生成画布兜底帧（请检查本机 ffmpeg 是否支持 lavfi）。")
 
     srt_lines: list[str] = []
     step = duration / max(len(subtitle_lines), 1)
@@ -432,8 +549,8 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
         head_overlay = (
             "drawbox=x=0:y=0:w=iw:h=110:color=black@0.35:t=fill,"
             f"drawtext=fontfile={font}:text='{source}':x=24:y=30:fontsize=30:fontcolor=white:borderw=1:bordercolor=black@0.7,"
-            "drawbox=x=0:y=h-190:w=iw:h=190:color=black@0.42:t=fill,"
-            f"drawtext=fontfile={font}:text='{subtitle_text}':x=(w-text_w)/2:y=h-118:fontsize=38:fontcolor=white:borderw=2:bordercolor=black@0.88,"
+            "drawbox=x=0:y=h-250:w=iw:h=250:color=black@0.56:t=fill,"
+            f"drawtext=fontfile={font}:text='{subtitle_text}':x=(w-text_w)/2:y=h-154:fontsize=52:fontcolor=white:borderw=4:bordercolor=black@0.95:shadowx=2:shadowy=2:shadowcolor=black@0.65,"
             "format=yuv420p"
         )
 
@@ -470,7 +587,7 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
                     "-stream_loop",
                     "-1",
                     "-i",
-                    str(clip),
+                    clip,
                     "-t",
                     f"{seg_dur:.2f}",
                     "-vf",
@@ -490,7 +607,7 @@ async def render_video_stub(job_dir: Path, meta: dict) -> tuple[str | None, str 
                 "-stream_loop",
                 "-1",
                 "-i",
-                str(clip),
+                clip,
                 "-t",
                 f"{seg_dur:.2f}",
                 "-vf",

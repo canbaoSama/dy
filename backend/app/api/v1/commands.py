@@ -1,22 +1,61 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
-from app.models import CommandLog, JobStatus, ScriptRecord, VideoJob
+from app.models import CommandLog, JobAsset, JobStatus, NewsItem, ScriptRecord, SubtitleTimeline, VideoJob
 from app.schemas import CommandRequest, CommandResponse, JobOut
+from app.services.asset_download import download_binary
 from app.services.command_parser import parse_command
+from app.services.candidate_translate import translate_to_zh
 from app.services.script_gen import rewrite_script_payload
 from app.services.candidate_list import query_candidate_rows, serialize_candidates
+from app.services.content_extract import extract_article, fetch_media_candidates
 from app.services.rss_ingest import ensure_default_sources
+from app.api.v1.jobs import run_step_audio, run_step_render, run_step_script, run_step_subtitles
 
 from app.api.v1.jobs import _run_pipeline_bg
 
 router = APIRouter(tags=["commands"])
+
+
+async def _safe_sync_sources(session: AsyncSession) -> None:
+    try:
+        await ensure_default_sources(session)
+    except Exception:
+        # 常见于 SQLite 被其他进程持锁；降级为沿用当前源配置，避免 /commands 直接 500。
+        await session.rollback()
+
+def _build_subtitle_draft_lines(item: NewsItem) -> list[str]:
+    content = str(item.cleaned_content or "").strip()
+    if not content:
+        content = str(item.summary_one_liner or item.title or "").strip()
+    if not content:
+        return ["（正文暂不可用，请稍后重试）"]
+    raw = [x.strip(" \t-•。") for x in content.replace("\r", "\n").split("\n")]
+    lines = [x for x in raw if x]
+    if not lines:
+        lines = [content[:120]]
+    return [x[:70] for x in lines[:8]]
+
+
+async def _to_zh_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    for x in lines:
+        s = (x or "").strip()
+        if not s:
+            continue
+        try:
+            out.append((await translate_to_zh(s)).strip() or s)
+        except Exception:
+            out.append(s)
+    return out
 
 
 @router.post("/commands", response_model=CommandResponse)
@@ -32,11 +71,11 @@ async def chat_command(
 
     if parsed["kind"] == "candidates":
         # 每次查看候选前先对齐当前默认信源开关，避免看到历史旧来源
-        await ensure_default_sources(session)
+        await _safe_sync_sources(session)
         rows = await query_candidate_rows(session)
         items = await serialize_candidates(rows)
         lines = [
-            f"{x.index}. 【{x.source}】{x.title_zh or x.title}（热度指数 {x.heat_index if x.heat_index is not None else '-'} · {x.tier}）"
+            f"{x.index}. 【{x.source}】{x.title_zh or x.title}（热度指数 {x.heat_index if x.heat_index is not None else '-'} · {x.tier}）\n   {x.url}"
             for x in items[:15]
         ]
         reply = (
@@ -48,7 +87,7 @@ async def chat_command(
         return CommandResponse(reply=reply, candidates=items[:15])
 
     if parsed["kind"] == "make_job":
-        await ensure_default_sources(session)
+        await _safe_sync_sources(session)
         idx = int(parsed["index"])
         rows = await query_candidate_rows(session)
         if idx < 1 or idx > len(rows):
@@ -64,18 +103,271 @@ async def chat_command(
         await session.commit()
         await session.refresh(job)
         return CommandResponse(
-            reply=f"已创建任务 #{job.id}。发送「开始渲染」或调用 POST /api/v1/jobs/{job.id}/pipeline 开始生产。",
+            reply=(
+                f"已创建任务 #{job.id}。\n"
+                "现在进入人工编排模式：\n"
+                "1) 发送「素材候选」查看可用素材\n"
+                "2) 发送「选素材 1,3」将素材加入任务\n"
+                "3) 再按步骤执行：生成脚本/生成音频/生成字幕/合成视频"
+            ),
             active_job_id=job.id,
             job=JobOut.model_validate(job),
         )
+
+    if parsed["kind"] == "asset_candidates":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）或指定 active_job_id。")
+        job = await session.get(VideoJob, jid)
+        if not job:
+            return CommandResponse(reply="任务不存在。")
+        job.status = JobStatus.extracting_content.value
+        await session.commit()
+        if not (job.news_item_id is None):
+            item2 = await session.get(NewsItem, job.news_item_id)
+            if item2 and not (item2.cleaned_content or "").strip():
+                try:
+                    await extract_article(session, item2)
+                    await session.commit()
+                except Exception:
+                    pass
+        job.status = JobStatus.collecting_assets.value
+        await session.commit()
+        item = await session.get(NewsItem, job.news_item_id)
+        if not item or not (item.url or "").strip():
+            return CommandResponse(reply="该任务缺少新闻 URL。")
+        try:
+            assets = await fetch_media_candidates(item.url)
+        except Exception as e:
+            return CommandResponse(reply=f"抓取素材候选失败：{e}", active_job_id=jid)
+        if not assets:
+            return CommandResponse(reply="未找到可用素材候选。", active_job_id=jid)
+        lines = [
+            f"{i+1}. [{('视频' if a.get('asset_type') == 'user_video' else '图片')}] {a.get('url')}"
+            for i, a in enumerate(assets[:12])
+        ]
+        extracted_chars = len((item.cleaned_content or "").strip()) if item else 0
+        extract_hint = (
+            f"步骤 1/2：正文抽取完成（约 {extracted_chars} 字）。\n"
+            if extracted_chars > 0
+            else "步骤 1/2：正文抽取完成（正文不足时已使用摘要降级）。\n"
+        )
+        reply = (
+            extract_hint
+            + "步骤 2/2：素材候选如下（仅展示，需你确认后加入）：\n"
+            + "\n".join(lines)
+            + "\n\n发送「选素材 1,3」即可把第 1 和第 3 条加入任务素材。"
+        )
+        return CommandResponse(reply=reply, active_job_id=jid)
+
+    if parsed["kind"] == "select_assets":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）或指定 active_job_id。")
+        job = await session.get(VideoJob, jid)
+        if not job:
+            return CommandResponse(reply="任务不存在。")
+        job.status = JobStatus.collecting_assets.value
+        await session.commit()
+        item = await session.get(NewsItem, job.news_item_id)
+        if not item or not (item.url or "").strip():
+            return CommandResponse(reply="该任务缺少新闻 URL。")
+        idxs = [int(x) for x in (parsed.get("indices") or []) if int(x) > 0]
+        if not idxs:
+            return CommandResponse(reply="请选择素材序号，例如：选素材 1,3", active_job_id=jid)
+        assets = await fetch_media_candidates(item.url)
+        chosen = [assets[i - 1] for i in idxs if 1 <= i <= len(assets)]
+        if not chosen:
+            return CommandResponse(reply="素材序号无效，请先发送「素材候选」查看列表。", active_job_id=jid)
+        save_dir = settings.assets_dir / f"job_{jid}" / "picked_remote"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        existed = await session.scalar(select(func.count()).select_from(JobAsset).where(JobAsset.job_id == jid))
+        base = int(existed or 0)
+        added = 0
+        for i, a in enumerate(chosen):
+            url = str(a.get("url") or "").strip()
+            t = str(a.get("asset_type") or "").strip() or "user_image"
+            if t == "user_image":
+                ext = Path(url.split("?")[0]).suffix.lower()
+                if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+                    ext = ".jpg"
+                p = save_dir / f"picked_{base + i}{ext}"
+                try:
+                    await download_binary(url, p)
+                except Exception:
+                    continue
+                session.add(
+                    JobAsset(
+                        job_id=jid,
+                        asset_type="user_image",
+                        local_path=str(p),
+                        remote_url=url,
+                        meta_json={"from": "chat_select"},
+                    )
+                )
+                added += 1
+            else:
+                session.add(
+                    JobAsset(
+                        job_id=jid,
+                        asset_type="user_video",
+                        remote_url=url,
+                        meta_json={"from": "chat_select"},
+                    )
+                )
+                added += 1
+        await session.commit()
+        return CommandResponse(
+            reply=f"已加入 {added} 个素材。已自动进入下一步：生成字幕。",
+            active_job_id=jid,
+        )
+    if parsed["kind"] == "step_subtitle_draft":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        job = await session.get(VideoJob, int(jid))
+        if not job:
+            return CommandResponse(reply="任务不存在。")
+        item = await session.get(NewsItem, job.news_item_id)
+        if not item:
+            return CommandResponse(reply="新闻不存在。")
+        if not (item.cleaned_content or "").strip():
+            try:
+                await extract_article(session, item)
+                await session.commit()
+            except Exception:
+                pass
+        lines = await _to_zh_lines(_build_subtitle_draft_lines(item))
+        job.status = JobStatus.generating_subtitles.value
+        await session.commit()
+        preview = "\n".join(f"- {x}" for x in lines[:6])
+        return CommandResponse(
+            reply=(
+                f"字幕步骤完成，任务：#{jid}，共 {len(lines)} 条。\n"
+                f"字幕预览：\n{preview}\n"
+                "你可以在对话框中直接编辑字幕并保存；确认后发送「确认字幕」继续。"
+            ),
+            active_job_id=int(jid),
+        )
+
 
     if parsed["kind"] == "render":
         jid = parsed.get("job_id") or body.active_job_id
         if not jid:
             return CommandResponse(reply="请指定任务：先「做第 N 条」创建任务，或传入 active_job_id。")
-        background_tasks.add_task(_run_pipeline_bg, int(jid))
+        await run_step_render(int(jid), session)
         return CommandResponse(
-            reply=f"已开始执行任务 #{jid} 的生产管线（异步）。可 GET /api/v1/jobs/{jid}/detail 查看进度与产物。",
+            reply=f"已完成任务 #{jid} 的视频合成步骤。可在任务面板预览。",
+            active_job_id=int(jid),
+        )
+
+    if parsed["kind"] == "step_script":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        r = await run_step_script(int(jid), session)
+        p = r.get("payload") or {}
+        titles = list(p.get("titles") or [])[:3]
+        body_lines = list(p.get("body") or [])[:3]
+        reply = (
+            f"脚本步骤完成（v{r.get('version')}）。\n"
+            f"Hook：{p.get('hook') or '—'}\n"
+            + ("正文：\n" + "\n".join(f"- {x}" for x in body_lines) + "\n" if body_lines else "")
+            + ("标题建议：\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles)) + "\n" if titles else "")
+            + "下一步可执行：字幕时间轴。"
+        )
+        return CommandResponse(reply=reply, active_job_id=int(jid))
+
+    if parsed["kind"] == "step_audio":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        r = await run_step_audio(int(jid), session)
+        return CommandResponse(
+            reply=(
+                "音频步骤完成。\n"
+                f"任务：#{jid}\n"
+                f"时长：{r.get('duration_sec')}s\n"
+                f"文件：{r.get('file_path')}\n"
+                f"试听地址：/api/v1/jobs/{jid}/audio/latest\n"
+                "如确认可发送「确认音频」继续合成视频。"
+            ),
+            active_job_id=int(jid),
+        )
+
+    if parsed["kind"] == "step_timeline":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        r = await run_step_subtitles(int(jid), session)
+        r_tl = await session.execute(
+            select(SubtitleTimeline).where(SubtitleTimeline.job_id == int(jid)).order_by(SubtitleTimeline.id.desc()).limit(1)
+        )
+        st = r_tl.scalar_one_or_none()
+        cues = []
+        if st and (st.timeline_json or "").strip():
+            try:
+                cues = json.loads(st.timeline_json)
+            except Exception:
+                cues = []
+        preview_src = [str(x.get("text") or "").strip() for x in list(cues)[:4] if isinstance(x, dict)]
+        preview_zh = await _to_zh_lines(preview_src)
+        preview = "\n".join(f"- {x}" for x in preview_zh if x)
+        return CommandResponse(
+            reply=(
+                f"字幕时间轴完成，任务：#{jid}，共 {r.get('count')} 条。\n"
+                + (f"字幕预览：\n{preview}\n" if preview else "")
+                + "下一步将进入配音合成。"
+            ),
+            active_job_id=int(jid),
+        )
+
+    if parsed["kind"] == "confirm_subtitles":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        job = await session.get(VideoJob, int(jid))
+        if not job:
+            return CommandResponse(reply="任务不存在。")
+        job.status = JobStatus.generating_subtitles.value
+        await session.commit()
+        return CommandResponse(
+            reply=(
+                f"字幕已确认（任务：#{jid}）。\n"
+                "即将继续：脚本生成 -> 字幕时间轴 -> 配音合成。"
+            ),
+            active_job_id=int(jid),
+        )
+
+    if parsed["kind"] == "confirm_audio":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        r = await run_step_render(int(jid), session)
+        return CommandResponse(
+            reply=(
+                "视频合成完成。\n"
+                f"任务：#{jid}\n"
+                f"视频文件：{r.get('video_path')}\n"
+                f"预览地址：/api/v1/jobs/{jid}/video/latest\n"
+                f"下载地址：/api/v1/jobs/{jid}/video/latest/download"
+            ),
+            active_job_id=int(jid),
+        )
+
+    if parsed["kind"] == "step_render":
+        jid = body.active_job_id
+        if not jid:
+            return CommandResponse(reply="请先创建任务（做第 N 条）。")
+        r = await run_step_render(int(jid), session)
+        return CommandResponse(
+            reply=(
+                "视频合成完成。\n"
+                f"任务：#{jid}\n"
+                f"视频文件：{r.get('video_path')}\n"
+                f"预览地址：/api/v1/jobs/{jid}/video/latest\n"
+                f"下载地址：/api/v1/jobs/{jid}/video/latest/download"
+            ),
             active_job_id=int(jid),
         )
 

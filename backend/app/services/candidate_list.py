@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 from datetime import datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -63,15 +65,21 @@ def _source_traffic_weight(source_name: str) -> float:
 def _fallback_heat_score(item: NewsItem) -> float:
     """当尚未完成候选打分时，用来源权重+时效性给一个 0~10 热度分。"""
     now = datetime.now(timezone.utc)
-    rank_at = item.last_seen_at or item.published_at or item.created_at or now
+    rank_at = item.published_at or item.last_seen_at or item.created_at or now
     if rank_at.tzinfo is None:
         rank_at = rank_at.replace(tzinfo=timezone.utc)
     age_hours = max(0.0, (now - rank_at).total_seconds() / 3600.0)
     # 0 小时=1.0，24 小时约 0.4，48 小时约 0.1
     freshness = max(0.1, 1.0 - min(age_hours, 48.0) / 40.0)
     src = item.source.name if item.source else ""
-    raw = 6.0 * freshness * _source_heat_boost(src)
-    return round(max(0.0, min(raw, 10.0)), 1)
+    text = f"{item.title or ''} {item.summary_one_liner or ''}".lower()
+    tokens = re.findall(r"[a-z0-9\u4e00-\u9fff]{3,}", text)
+    unique_ratio = (len(set(tokens)) / max(len(tokens), 1)) if tokens else 0.0
+    richness_bonus = min(0.8, unique_ratio * 0.8)
+    hash_seed = item.url_hash or hashlib.sha1((item.url or "").encode("utf-8")).hexdigest()
+    hash_jitter = (int(hash_seed[-2:], 16) / 255.0) * 0.45
+    raw = 5.8 * freshness * _source_heat_boost(src) + richness_bonus + hash_jitter
+    return round(max(0.0, min(raw, 10.0)), 2)
 
 
 def _item_heat_score_10(item: NewsItem) -> float:
@@ -88,7 +96,7 @@ def _item_heat_score_10(item: NewsItem) -> float:
 
 def _item_recency_score_10(item: NewsItem) -> float:
     now = datetime.now(timezone.utc)
-    rank_at = item.last_seen_at or item.published_at or item.created_at or now
+    rank_at = item.published_at or item.last_seen_at or item.created_at or now
     if rank_at.tzinfo is None:
         rank_at = rank_at.replace(tzinfo=timezone.utc)
     age_hours = max(0.0, (now - rank_at).total_seconds() / 3600.0)
@@ -121,8 +129,32 @@ def _item_heat_index(item: NewsItem) -> int:
     heat10 = _item_heat_score_10(item)
     src_w = _source_traffic_weight(item.source.name if item.source else "")
     rec10 = _item_recency_score_10(item)
-    val = int(round(heat10 * 1200 + src_w * 2600 + rec10 * 350))
+    hash_seed = item.url_hash or hashlib.sha1((item.url or "").encode("utf-8")).hexdigest()
+    jitter = int(hash_seed[-4:], 16) % 180
+    val = int(round(heat10 * 1200 + src_w * 2600 + rec10 * 350 + jitter))
     return max(100, val)
+
+
+def _diversify_by_source(rows: list[NewsItem], limit: int) -> list[NewsItem]:
+    """限制单一来源占比，避免候选被单一信源刷屏。"""
+    if not rows:
+        return rows
+    max_per_source = max(2, min(5, (limit + 2) // 3))
+    picked: list[NewsItem] = []
+    src_count: dict[str, int] = {}
+    remain: list[NewsItem] = []
+    for it in rows:
+        key = (it.source.name if it.source else "") or "__unknown__"
+        cnt = src_count.get(key, 0)
+        if cnt < max_per_source and len(picked) < limit:
+            picked.append(it)
+            src_count[key] = cnt + 1
+        else:
+            remain.append(it)
+    if len(picked) < limit:
+        need = limit - len(picked)
+        picked.extend(remain[:need])
+    return picked[:limit]
 
 
 async def query_candidate_rows(session: AsyncSession, limit: int = 50) -> list[NewsItem]:
@@ -157,7 +189,7 @@ async def query_candidate_rows(session: AsyncSession, limit: int = 50) -> list[N
     if len(rows) < 3:
         rows = await _fetch(datetime.now(timezone.utc) - timedelta(days=7))
     rows.sort(key=lambda x: (_item_composite_rank(x), x.id), reverse=True)
-    return rows[:limit]
+    return _diversify_by_source(rows, limit)
 
 
 async def serialize_candidates(rows: list[NewsItem]) -> list[CandidateItem]:

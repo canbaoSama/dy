@@ -56,6 +56,32 @@ SOURCE_CATALOG: list[SourceRow] = [
         "note_zh": "MSN 综合热点入口；如失效可替换为频道 RSS。",
     },
 
+    # —— 网络受限时的备用源（多数国际站超时/429 时仍可拉取）——
+    {
+        "slug": "un_news_all",
+        "name": "UN News · All Stories (RSS)",
+        "name_zh": "联合国新闻 · 综合",
+        "rss_url": "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
+        "group_zh": "备用 / 可达",
+        "note_zh": "国际机构通稿，境内网络通常可直连。",
+    },
+    {
+        "slug": "xinhua_world_en",
+        "name": "Xinhua · World (English RSS)",
+        "name_zh": "新华社 · 国际（英文）",
+        "rss_url": "https://www.xinhuanet.com/english/rss/worldrss.xml",
+        "group_zh": "备用 / 可达",
+        "note_zh": "英文国际要闻，作热点补充。",
+    },
+    {
+        "slug": "cgtn_world",
+        "name": "CGTN · World (RSS)",
+        "name_zh": "CGTN · 国际",
+        "rss_url": "https://www.cgtn.com/subscribe/rss/section/world.xml",
+        "group_zh": "备用 / 可达",
+        "note_zh": "国际视频新闻机构的 RSS 提要。",
+    },
+
     # —— 第二层：权威新闻源（高可信）——
     {
         "slug": "reuters_top",
@@ -112,8 +138,16 @@ SOURCE_CATALOG: list[SourceRow] = [
 _SLUG_INDEX: dict[str, SourceRow] = {row["slug"]: row for row in SOURCE_CATALOG}
 
 
-# 未配置 NEWS_SOURCE_SLUGS 时：默认启用目录内全部来源
-DEFAULT_SOURCE_SLUGS: tuple[str, ...] = tuple(r["slug"] for r in SOURCE_CATALOG)
+# 未配置 NEWS_SOURCE_SLUGS 时：默认启用“网络更可达”的组合。
+# 说明：部分国际媒体域名在当前网络环境可能长期超时/解析失败，
+# 默认使用可达优先，用户仍可通过 NEWS_SOURCE_SLUGS 显式覆盖。
+DEFAULT_SOURCE_SLUGS: tuple[str, ...] = (
+    "un_news_all",
+    "xinhua_world_en",
+    "cgtn_world",
+    "ap_top",
+    "msn_news_us",
+)
 
 
 def resolve_news_sources(slugs_csv: str | None) -> list[dict[str, str]]:

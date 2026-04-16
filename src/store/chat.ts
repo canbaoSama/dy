@@ -4,10 +4,11 @@ import dayjs from 'dayjs'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import {
+  type CandidateLite,
   createJobFromCandidate,
   postCommand,
+  translateCandidatesToZh,
   triggerIngest,
-  triggerPipeline,
   triggerRerender,
   uploadJobAssets,
   type CommandResponse,
@@ -21,16 +22,36 @@ interface ChatState {
   jobHistory: number[]
   jobStatusMap: Record<number, string>
   ingestLoading: boolean
+  translatingCandidates: boolean
   lastCandidates: NonNullable<CommandResponse['candidates']> | null
+}
+
+function splitAssistantReply(reply: string): string[] {
+  const raw = String(reply || '').trim()
+  if (!raw) return []
+  if (!raw.includes('步骤 2/2：素材候选如下')) return [raw]
+  const lines = raw.split('\n')
+  const step1 = lines.find((x) => x.startsWith('步骤 1/2：正文抽取完成'))
+  const idx = lines.findIndex((x) => x.startsWith('步骤 2/2：素材候选如下'))
+  if (!step1 || idx < 0) return [raw]
+  const material = lines.slice(idx).join('\n').trim()
+  return [step1, material].filter(Boolean)
 }
 
 function formatChatError(e: unknown): string {
   if (axios.isAxiosError(e)) {
+    const status = e.response?.status
+    if (status === 502 || status === 503) {
+      return '无法连接后端（网关 502/503）。开发模式下请先在 backend 目录执行 bash run.sh，确保服务监听 http://127.0.0.1:8000，再刷新本页。'
+    }
+    if (!e.response && (e.code === 'ERR_NETWORK' || e.message === 'Network Error')) {
+      return '网络请求失败：请确认后端已启动，且浏览器能访问与 Vite 代理一致的后端地址。'
+    }
     const d = e.response?.data
     if (d && typeof d === 'object' && 'detail' in d) {
       return String((d as { detail: unknown }).detail)
     }
-    return e.message || `请求失败（${e.response?.status ?? '网络'}）`
+    return e.message || `请求失败（${status ?? '网络'}）`
   }
   if (e instanceof Error) return e.message
   return '发送失败'
@@ -44,10 +65,34 @@ export const useChatStore = defineStore('chat', {
     jobHistory: [],
     jobStatusMap: {},
     ingestLoading: false,
+    translatingCandidates: false,
     lastCandidates: null,
   }),
 
   actions: {
+    async runAutoSteps(jobId: number, steps: string[]) {
+      for (const step of steps) {
+        try {
+          const res = await postCommand(step, jobId)
+          if (res.active_job_id != null) this.activeJobId = res.active_job_id
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: res.reply,
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+          })
+        } catch (e) {
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: `自动步骤「${step}」执行失败：${formatChatError(e)}`,
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+          })
+          break
+        }
+      }
+    },
+
     clear() {
       this.messages = []
       this.lastCandidates = null
@@ -68,6 +113,17 @@ export const useChatStore = defineStore('chat', {
       this.messages.push(msg)
     },
 
+    appendAssistantReply(reply: string) {
+      for (const block of splitAssistantReply(reply)) {
+        this.messages.push({
+          id: uuidv4(),
+          role: 'assistant',
+          content: block,
+          createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+        })
+      }
+    },
+
     /** 进入页面时拉取今日候选：只追加助手消息，不插入用户气泡 */
     async bootstrapTodayCandidates() {
       if (this.loading) return
@@ -80,12 +136,7 @@ export const useChatStore = defineStore('chat', {
         if (Array.isArray(res.candidates)) {
           this.lastCandidates = res.candidates.length > 0 ? res.candidates : null
         }
-        this.messages.push({
-          id: uuidv4(),
-          role: 'assistant',
-          content: res.reply,
-          createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-        })
+          this.appendAssistantReply(res.reply)
       } catch (e) {
         ElMessage.warning(formatChatError(e))
       } finally {
@@ -99,25 +150,30 @@ export const useChatStore = defineStore('chat', {
         const r = await triggerIngest()
         const failedCount = r.failed_count ?? 0
         const refreshed = r.refreshed ?? 0
+        const successCount = r.added + refreshed
         ElMessage.success(
-          `抓取完成：新增 ${r.added} 条${refreshed ? `，热点刷新 ${refreshed} 条` : ''}${failedCount ? `，失败 ${failedCount} 条` : ''}`,
+          successCount > 0
+            ? `抓取完成：新增 ${r.added} 条${refreshed ? `，热点刷新 ${refreshed} 条` : ''}${failedCount ? `，部分源失败 ${failedCount} 条` : ''}`
+            : `抓取完成：暂无新增${failedCount ? `，失败 ${failedCount} 条` : ''}`,
         )
         const failHint =
           failedCount && r.failed?.length
-            ? `\n失败源：${r.failed.slice(0, 3).map((x) => x.source).join(' / ')}`
+            ? `\n失败源：${r.failed.slice(0, 3).map((x) => x.source).join(' / ')}${
+                r.failed[0]?.error ? `\n原因示例：${String(r.failed[0].error).slice(0, 220)}` : ''
+              }`
             : ''
         const hotHint =
           r.hot_top?.length
             ? `\n热度TOP：\n${r.hot_top
                 .slice(0, 5)
-                .map((x) => `${x.index}. 【${x.source}】${x.title}（热度指数 ${x.heat_index ?? '-'}）`)
+                .map((x) => `${x.index}. 【${x.source}】${x.title}（🔥${x.heat_index ?? '-'}）`)
                 .join('\n')}`
             : ''
         this.messages.push({
           id: uuidv4(),
           role: 'assistant',
           content: `抓取完成：新增 ${r.added} 条${refreshed ? `，热点刷新 ${refreshed} 条` : ''}（信源 ${r.sources} 个）${
-            failedCount ? `，失败 ${failedCount} 条` : ''
+            failedCount ? `，部分源失败 ${failedCount} 条` : ''
           }。正在同步今日候选…${hotHint}${failHint}`,
           createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
         })
@@ -125,7 +181,7 @@ export const useChatStore = defineStore('chat', {
           this.lastCandidates = r.candidates.length > 0 ? r.candidates : null
           const lines = r.candidates
             .slice(0, 15)
-            .map((x, i) => `${i + 1}. 【${x.source}】${x.title_zh || x.title}（热度指数 ${x.heat_index ?? '-'} · ${x.tier}）`)
+            .map((x, i) => `${i + 1}. 【${x.source}】${x.title_zh || x.title}（🔥${x.heat_index ?? '-'}）`)
           this.messages.push({
             id: uuidv4(),
             role: 'assistant',
@@ -146,6 +202,33 @@ export const useChatStore = defineStore('chat', {
         ElMessage.error(formatChatError(e))
       } finally {
         this.ingestLoading = false
+      }
+    },
+
+    async translateCurrentCandidatesToZh() {
+      if (this.translatingCandidates) return
+      if (!this.lastCandidates?.length) {
+        ElMessage.warning('当前没有可翻译的候选')
+        return
+      }
+      this.translatingCandidates = true
+      try {
+        const translated = await translateCandidatesToZh(this.lastCandidates as CandidateLite[])
+        const patchMap = new Map(translated.map((x) => [`${x.index}|||${x.url}`, x] as const))
+        this.lastCandidates = this.lastCandidates.map((x) => {
+          const p = patchMap.get(`${x.index}|||${x.url}`)
+          if (!p) return x
+          return {
+            ...x,
+            title_zh: p.title_zh || x.title_zh || x.title,
+            summary_zh: p.summary_zh || x.summary_zh || x.summary || '',
+          }
+        })
+        ElMessage.success('已将当前候选转为中文')
+      } catch (e) {
+        ElMessage.error(formatChatError(e))
+      } finally {
+        this.translatingCandidates = false
       }
     },
 
@@ -181,12 +264,13 @@ export const useChatStore = defineStore('chat', {
         if (Array.isArray(res.candidates)) {
           this.lastCandidates = res.candidates.length > 0 ? res.candidates : null
         }
-        this.messages.push({
-          id: uuidv4(),
-          role: 'assistant',
-          content: res.reply,
-          createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-        })
+        this.appendAssistantReply(res.reply)
+        if (/^选素材\s*/.test(text) && this.activeJobId != null) {
+          await this.runAutoSteps(this.activeJobId, ['生成字幕'])
+        }
+        if (/^确认字幕\s*/.test(text) && this.activeJobId != null) {
+          await this.runAutoSteps(this.activeJobId, ['生成脚本', '字幕时间轴', '生成音频'])
+        }
       } catch (e) {
         ElMessage.error(formatChatError(e))
         this.messages.pop()
@@ -208,16 +292,24 @@ export const useChatStore = defineStore('chat', {
       this.loading = true
       try {
         const { job } = await createJobFromCandidate(index)
-        await triggerPipeline(job.id)
         this.activeJobId = job.id
         if (!this.jobHistory.includes(job.id)) this.jobHistory.unshift(job.id)
         this.jobStatusMap[job.id] = 'created'
         this.messages.push({
           id: uuidv4(),
           role: 'assistant',
-          content: `已开始处理第 ${index} 条，任务 #${job.id} 已进入流水线。`,
+          content:
+            `已创建任务 #${job.id}（候选第 ${index} 条）。\n` +
+            `已自动执行：创建任务 -> 正文抽取 -> 素材收集（候选展示）。\n` +
+            `请你先判断素材并点击“选这个”（或发送「选素材 1,3」）。\n` +
+            `选完素材后将自动继续：字幕生成（可编辑）。\n` +
+            `然后由你确认：确认字幕 -> 脚本生成 -> 字幕时间轴 -> 生成音频（可试听） -> 确认音频 -> 合成视频（对话框内预览+下载）。\n` +
+            `每一步结果都会在对话框内回显。`,
           createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
         })
+        // 一键渲染后立即进入流水线（素材收集阶段），先展示素材候选待确认
+        const candidateReply = await postCommand('素材候选', job.id)
+        this.appendAssistantReply(candidateReply.reply)
       } catch (e) {
         ElMessage.error(formatChatError(e))
       } finally {

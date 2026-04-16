@@ -3,14 +3,13 @@
 export const PIPELINE_STAGES = [
   { key: 'created', label: '创建' },
   { key: 'extracting_content', label: '正文抽取' },
-  { key: 'scoring_candidate', label: '候选评分' },
-  { key: 'generating_script', label: '脚本生成' },
   { key: 'collecting_assets', label: '素材收集' },
-  { key: 'generating_audio', label: '配音合成' },
+  { key: 'generating_subtitles', label: '字幕生成' },
+  { key: 'generating_script', label: '脚本生成' },
   { key: 'building_timeline', label: '字幕时间轴' },
+  { key: 'generating_audio', label: '配音合成' },
   { key: 'rendering_video', label: '视频渲染' },
-  { key: 'ready_for_review', label: '待审核' },
-  { key: 'approved', label: '已批准' },
+  { key: 'ready_for_review', label: '完成' },
 ] as const
 
 export type PipelineStageKey = (typeof PIPELINE_STAGES)[number]['key']
@@ -19,7 +18,7 @@ export type StageVisualState = 'pending' | 'running' | 'success' | 'failed' | 's
 
 const KEYS = PIPELINE_STAGES.map((s) => s.key)
 
-const SUCCESS_DISPLAY = new Set<string>(['ready_for_review', 'approved'])
+const SUCCESS_DISPLAY = new Set<string>(['ready_for_review'])
 
 export function computeStageStates(status: string, failedStage: string | null | undefined): StageVisualState[] {
   if (status === 'created') {
@@ -43,10 +42,6 @@ export function computeStageStates(status: string, failedStage: string | null | 
       if (i === fi) return 'failed'
       return 'skipped'
     }) as StageVisualState[]
-  }
-
-  if (status === 'approved') {
-    return KEYS.map(() => 'success') as StageVisualState[]
   }
 
   const idx = KEYS.indexOf(status as PipelineStageKey)
@@ -86,6 +81,7 @@ export function pipelineStageUi(key: string): { label: string; icon: string; acc
     scoring_candidate: { icon: '⭐', accent: 'amber' },
     generating_script: { icon: '✍️', accent: 'violet' },
     collecting_assets: { icon: '🖼️', accent: 'fuchsia' },
+    generating_subtitles: { icon: '📝', accent: 'amber' },
     generating_audio: { icon: '🎙️', accent: 'rose' },
     building_timeline: { icon: '💬', accent: 'sky' },
     rendering_video: { icon: '🎬', accent: 'emerald' },

@@ -233,6 +233,7 @@ async def run_job_pipeline(session: AsyncSession, job_id: int, options: dict | N
         user_assets = list(r_user_assets.scalars().all())
         user_image_paths = [a.local_path for a in user_assets if a.asset_type == "user_image" and a.local_path]
         user_video_paths = [a.local_path for a in user_assets if a.asset_type == "user_video" and a.local_path]
+        user_video_urls = [a.remote_url for a in user_assets if a.asset_type == "user_video" and a.remote_url]
 
         video_path, preview_path = await render_video_stub(
             job_dir,
@@ -249,6 +250,7 @@ async def run_job_pipeline(session: AsyncSession, job_id: int, options: dict | N
                 "audio_path": audio_path,
                 "user_image_paths": user_image_paths,
                 "user_video_paths": user_video_paths,
+                "user_video_urls": user_video_urls,
                 "must_use_uploaded_assets": bool(opts.get("must_use_uploaded_assets", False)),
                 "prefer_video_assets": bool(opts.get("prefer_video_assets", False)),
                 "subtitle_tone": str(opts.get("subtitle_tone") or "").strip() or None,

@@ -8,11 +8,11 @@ import { AGENT_NAME } from '@/config/app'
 import { QUICK_COMMANDS } from '@/constants/commands'
 import { PIPELINE_STAGES, pipelineStageIndex, pipelineStageUi } from '@/constants/pipeline'
 import { TTS_VOICE_OPTIONS } from '@/constants/tts'
-import { previewTtsVoice } from '@/api/factory'
+import { previewTtsVoice, updateLatestSubtitles } from '@/api/factory'
 import { useChatStore } from '@/store/chat'
 import type { ChatMessage } from '@/types/chat'
 import type { JobDetailResponse } from '@/types/job'
-import { splitAssistantRichSegments } from '@/utils/assistantRichText'
+import { expandUrlsInRichSegments, splitAssistantRichSegments } from '@/utils/assistantRichText'
 import { formatJobArtifact, type JobArtifactKind } from '@/utils/jobArtifactChat'
 import { buildPipelineStageBody } from '@/utils/pipelineChat'
 
@@ -21,6 +21,8 @@ const chatStore = useChatStore()
 const lastJobDetail = ref<JobDetailResponse | null>(null)
 /** 各任务上一次轮询到的状态，用于在对话里推送「阶段完成」卡片 */
 const lastPollStatus = ref<Record<number, string | undefined>>({})
+/** 各任务已推送过的阶段，防止重复补发 */
+const pushedStages = ref<Record<number, string[]>>({})
 const input = ref('')
 const listRef = ref<HTMLElement | null>(null)
 const uploadRef = ref<HTMLInputElement | null>(null)
@@ -36,6 +38,18 @@ const canSend = computed(() => input.value.trim().length > 0 && !chatStore.loadi
 const previewingVoice = ref(false)
 const previewReqSeq = ref(0)
 let previewAudio: HTMLAudioElement | null = null
+const flowCardMode = ref<'compact' | 'detail'>('compact')
+const pickedAssetMap = ref<Record<string, number[]>>({})
+const subtitleDraftMap = ref<Record<string, string>>({})
+const CHAT_OWNED_STAGES = new Set([
+  'collecting_assets',
+  'generating_subtitles',
+  'generating_script',
+  'building_timeline',
+  'generating_audio',
+  'rendering_video',
+  'ready_for_review',
+])
 
 const artifactQuickItems = computed(() => {
   const d = lastJobDetail.value
@@ -111,13 +125,301 @@ async function onSend() {
 function onClear() {
   // 保留 lastPollStatus，避免清空会话后下一轮轮询又把整条流水线重复推一遍
   chatStore.clear()
+  pushedStages.value = {}
 }
 
 function assistantSegments(item: ChatMessage) {
   if (item.role !== 'assistant' || item.bubbleKind === 'pipeline') {
     return [{ type: 'text' as const, text: item.content }]
   }
-  return splitAssistantRichSegments(item.content)
+  // 候选消息：标题本身可点击，不单独显示 URL 文本
+  if (item.content.startsWith('今日全球热点候选（抓取后自动更新）：')) {
+    const out: Array<{ type: 'index' | 'source' | 'text' | 'link'; text: string }> = []
+    const lines = item.content.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) out.push({ type: 'text', text: '\n' })
+      if (i === 0) {
+        out.push({ type: 'text', text: lines[i] })
+        continue
+      }
+      const m = lines[i].match(/^(\d+\.\s*)(【[^】]*】)(.*?)(（🔥[^）]*）)?$/)
+      if (!m) {
+        out.push({ type: 'text', text: lines[i] })
+        continue
+      }
+      out.push({ type: 'index', text: m[1] })
+      out.push({ type: 'source', text: m[2] })
+      const titleText = m[3] || ''
+      const idx = Number(m[1].replace('.', '').trim())
+      const url = chatStore.lastCandidates?.find((x) => x.index === idx)?.url?.trim()
+      if (url && titleText.trim()) {
+        out.push({ type: 'link', text: `${titleText}|||${url}` })
+      } else {
+        out.push({ type: 'text', text: titleText })
+      }
+      if (m[4]) out.push({ type: 'text', text: m[4] })
+    }
+    return out
+  }
+  // 通用兜底：若出现“候选行 + 下一行裸 URL”，隐藏 URL 行并把候选行做成可点击链接
+  if (item.content.includes('http://') || item.content.includes('https://')) {
+    const out: Array<{ type: 'index' | 'source' | 'text' | 'link'; text: string }> = []
+    const lines = item.content.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      const next = lines[i + 1] ?? ''
+      const nextUrl = next.match(/^\s*(https?:\/\/\S+)\s*$/)
+      const cur = line.match(/^(\d+\.\s*)(.+)$/)
+      if (cur && nextUrl) {
+        if (out.length) out.push({ type: 'text', text: '\n' })
+        out.push({ type: 'index', text: cur[1] })
+        out.push({ type: 'link', text: `${cur[2]}|||${nextUrl[1]}` })
+        i += 1
+        continue
+      }
+      if (out.length) out.push({ type: 'text', text: '\n' })
+      for (const b of splitAssistantRichSegments(line)) {
+        out.push(b)
+      }
+    }
+    return out
+  }
+  return expandUrlsInRichSegments(splitAssistantRichSegments(item.content))
+}
+
+function parseAssetCandidates(text: string): Array<{ index: number; type: 'image' | 'video'; url: string }> {
+  if (!text.includes('素材候选如下')) return []
+  const out: Array<{ index: number; type: 'image' | 'video'; url: string }> = []
+  for (const line of text.split('\n')) {
+    const m = line.match(/^(\d+)\.\s*\[(图片|视频)\]\s*(https?:\/\/\S+)$/)
+    if (!m) continue
+    out.push({
+      index: Number(m[1]),
+      type: m[2] === '视频' ? 'video' : 'image',
+      url: m[3],
+    })
+  }
+  return out
+}
+
+function parseAssetLeadSteps(text: string): string[] {
+  const rows = text
+    .split('\n')
+    .map((x) => x.trim())
+    .filter((x) => /^步骤\s*\d+\/\d+：/.test(x))
+  return rows.slice(0, 2)
+}
+
+function isAssetCandidateMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && item.content.includes('素材候选如下')
+}
+
+async function onPickAssetByIndex(index: number) {
+  await sendText(`选素材 ${index}`)
+}
+
+function toggleAssetPick(messageId: string, index: number) {
+  const current = new Set(pickedAssetMap.value[messageId] || [])
+  if (current.has(index)) current.delete(index)
+  else current.add(index)
+  pickedAssetMap.value[messageId] = Array.from(current).sort((a, b) => a - b)
+}
+
+async function submitPickedAssets(messageId: string) {
+  const picked = pickedAssetMap.value[messageId] || []
+  if (!picked.length) {
+    ElMessage.warning('请先选择至少一个素材')
+    return
+  }
+  await sendText(`选素材 ${picked.join(',')}`)
+}
+
+function toggleAllAssets(messageId: string, text: string) {
+  const all = parseAssetCandidates(text).map((x) => x.index)
+  const cur = new Set(pickedAssetMap.value[messageId] || [])
+  const isAll = all.length > 0 && all.every((x) => cur.has(x))
+  pickedAssetMap.value[messageId] = isAll ? [] : all
+}
+
+function getApiOrigin() {
+  const base = String(import.meta.env.VITE_API_BASE || '').trim()
+  if (!base) return window.location.origin
+  try {
+    return new URL(base).origin
+  } catch {
+    return window.location.origin
+  }
+}
+
+function resolveMediaUrl(url: string) {
+  const v = String(url || '').trim()
+  if (!v) return ''
+  if (/^https?:\/\//i.test(v)) return v
+  if (v.startsWith('/')) return `${getApiOrigin()}${v}`
+  return `${getApiOrigin()}/${v}`
+}
+
+function parseAudioPreviewUrl(text: string): string {
+  const m = text.match(/试听地址：\s*(\S+)/)
+  return m ? resolveMediaUrl(m[1]) : ''
+}
+
+function parseVideoPreviewUrl(text: string): string {
+  const m = text.match(/预览地址：\s*(\S+)/)
+  return m ? resolveMediaUrl(m[1]) : ''
+}
+
+function parseVideoDownloadUrl(text: string): string {
+  const m = text.match(/下载地址：\s*(\S+)/)
+  return m ? resolveMediaUrl(m[1]) : ''
+}
+
+function parseSubtitleJobId(text: string): number | null {
+  const m = text.match(/任务：#(\d+)/)
+  if (!m) return null
+  return Number(m[1])
+}
+
+function parseSubtitlePreviewLines(text: string): string[] {
+  const m = text.match(/字幕预览：\n([\s\S]*?)\n你可以在对话框中直接编辑字幕并保存/)
+  if (!m) return []
+  return m[1]
+    .split('\n')
+    .map((x) => x.replace(/^\-\s*/, '').trim())
+    .filter(Boolean)
+}
+
+function firstLine(text: string): string {
+  return String(text || '').split('\n')[0]?.trim() || ''
+}
+
+function compactBodyLines(text: string): string[] {
+  return String(text || '')
+    .split('\n')
+    .slice(1)
+    .map((x) => x.trim())
+    .filter((x) => x && !x.startsWith('试听地址：') && !x.startsWith('预览地址：') && !x.startsWith('下载地址：'))
+}
+
+function displayLines(lines: string[], compactLimit = 3): string[] {
+  if (flowCardMode.value === 'detail') return lines
+  return lines.slice(0, compactLimit)
+}
+
+function isSubtitleStepMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && item.content.startsWith('字幕步骤完成')
+}
+
+function isAudioStepMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && item.content.startsWith('音频步骤完成')
+}
+
+function isVideoStepMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && item.content.startsWith('视频合成完成')
+}
+
+function isTimelineStepMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && item.content.startsWith('字幕时间轴完成')
+}
+
+type FlowCardInfo = {
+  title: string
+  desc?: string
+  items?: string[]
+}
+
+function parseFlowCard(text: string): FlowCardInfo | null {
+  const t = String(text || '').trim()
+  if (!t) return null
+  if (t.startsWith('步骤 1/2：正文抽取完成')) {
+    const title = t.split('\n')[0]
+    const lines = t.split('\n').slice(1).map((x) => x.trim()).filter(Boolean)
+    return { title, desc: '正文抽取', items: lines }
+  }
+  if (t.startsWith('已加入') && t.includes('素材')) {
+    return { title: t.split('\n')[0], desc: '素材确认' }
+  }
+  if (t.startsWith('字幕已确认')) {
+    return { title: t.split('\n')[0], desc: '字幕确认', items: t.split('\n').slice(1).filter(Boolean) }
+  }
+  if (t.startsWith('脚本步骤完成')) {
+    const rows = t.split('\n').map((x) => x.trim()).filter(Boolean)
+    return { title: rows[0] || '脚本生成完成', desc: '脚本生成', items: rows.slice(1, 6) }
+  }
+  return null
+}
+
+function isFlowCardMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && !!parseFlowCard(item.content)
+}
+
+function flowIconByTag(tag?: string): string {
+  const t = String(tag || '')
+  if (t.includes('正文')) return '📄'
+  if (t.includes('素材')) return '🖼️'
+  if (t.includes('字幕')) return '📝'
+  if (t.includes('脚本')) return '✍️'
+  if (t.includes('时间轴')) return '⏱️'
+  if (t.includes('音频')) return '🎧'
+  if (t.includes('视频')) return '🎬'
+  return '✨'
+}
+
+function parseTimelineSummary(text: string): {
+  title: string
+  countText: string
+  previews: string[]
+  nextStep: string
+} {
+  const title = text.split('\n')[0]?.trim() || '字幕时间轴完成'
+  const count = text.match(/共\s*(\d+)\s*条/)
+  const next = text.match(/下一步.*$/m)
+  const previews = text
+    .split('\n')
+    .map((x) => x.trim())
+    .filter((x) => x.startsWith('- '))
+    .map((x) => x.replace(/^- /, '').trim())
+  return {
+    title,
+    countText: count ? `共 ${count[1]} 条` : '',
+    previews: previews.slice(0, 4),
+    nextStep: next?.[0] || '下一步将进入后续处理。',
+  }
+}
+
+function subtitleDraftFor(item: ChatMessage): string {
+  if (subtitleDraftMap.value[item.id] != null) return subtitleDraftMap.value[item.id]
+  const lines = parseSubtitlePreviewLines(item.content)
+  const fallback = lines.length ? lines.join('\n') : ''
+  subtitleDraftMap.value[item.id] = fallback
+  return fallback
+}
+
+async function onSaveSubtitles(item: ChatMessage) {
+  const jid = parseSubtitleJobId(item.content) ?? chatStore.activeJobId
+  if (!jid) {
+    ElMessage.warning('未识别到任务 ID')
+    return
+  }
+  const raw = (subtitleDraftMap.value[item.id] || '').trim()
+  if (!raw) {
+    ElMessage.warning('字幕内容不能为空')
+    return
+  }
+  const lines = raw.split('\n').map((x) => x.trim()).filter(Boolean)
+  const per = 2.5
+  const cues = lines.map((text, idx) => ({
+    start: Number((idx * per).toFixed(2)),
+    end: Number(((idx + 1) * per).toFixed(2)),
+    text,
+  }))
+  await updateLatestSubtitles(jid, cues)
+  chatStore.appendAssistantMessage({
+    id: uuidv4(),
+    role: 'assistant',
+    content: `字幕已保存（任务 #${jid}，共 ${cues.length} 条）。如确认可发送「确认字幕」继续生成音频。`,
+    createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  })
 }
 
 onMounted(() => {
@@ -132,6 +434,17 @@ onBeforeUnmount(() => {
 })
 
 function pushPipelineBubble(jobId: number, stageKey: string, body: string) {
+  if (CHAT_OWNED_STAGES.has(stageKey)) return
+  // “素材候选”消息里已包含“步骤 1/2（正文抽取）”，
+  // 若此时再补发正文抽取卡片，视觉上会变成“先素材候选，后正文抽取”。
+  if (
+    stageKey === 'extracting_content' &&
+    chatStore.messages.some((m) => m.role === 'assistant' && m.content.includes('步骤 2/2：素材候选如下'))
+  ) {
+    return
+  }
+  const done = new Set(pushedStages.value[jobId] || [])
+  if (done.has(stageKey)) return
   const ui = pipelineStageUi(stageKey)
   chatStore.appendAssistantMessage({
     id: uuidv4(),
@@ -147,6 +460,8 @@ function pushPipelineBubble(jobId: number, stageKey: string, body: string) {
       accent: ui.accent,
     },
   })
+  done.add(stageKey)
+  pushedStages.value[jobId] = Array.from(done)
 }
 
 function handleJobDetail(d: JobDetailResponse) {
@@ -181,6 +496,7 @@ function handleJobDetail(d: JobDetailResponse) {
   const prev = lastPollStatus.value[jid]
 
   if (prev === undefined) {
+    // 首次拿到状态时按阶段顺序补齐，配合 pushedStages 去重可避免重复和错序。
     const i = pipelineStageIndex(cur)
     if (i > 0) {
       for (let k = 0; k < i; k++) {
@@ -188,9 +504,6 @@ function handleJobDetail(d: JobDetailResponse) {
         if (sk === 'created') continue
         pushPipelineBubble(jid, sk, buildPipelineStageBody(sk, d))
       }
-    }
-    if (cur === 'ready_for_review' || cur === 'approved') {
-      pushPipelineBubble(jid, cur, buildPipelineStageBody(cur, d))
     }
     lastPollStatus.value[jid] = cur
     return
@@ -204,6 +517,7 @@ function handleJobDetail(d: JobDetailResponse) {
   const pj = pipelineStageIndex(prev)
   if (pi >= 0 && pj >= 0 && pi < pj) {
     lastPollStatus.value[jid] = undefined
+    pushedStages.value[jid] = []
     chatStore.appendAssistantMessage({
       id: uuidv4(),
       role: 'assistant',
@@ -214,7 +528,14 @@ function handleJobDetail(d: JobDetailResponse) {
     return
   }
 
-  if (prev !== 'created') {
+  if (pi >= 0 && pj >= 0 && pi > pj) {
+    // 跨阶段跳转时按区间补齐，避免只补上一阶段导致时序错乱。
+    for (let k = pj; k < pi; k++) {
+      const sk = PIPELINE_STAGES[k].key
+      if (sk === 'created') continue
+      pushPipelineBubble(jid, sk, buildPipelineStageBody(sk, d))
+    }
+  } else if (prev !== 'created') {
     pushPipelineBubble(jid, prev, buildPipelineStageBody(prev, d))
   }
   lastPollStatus.value[jid] = cur
@@ -310,6 +631,9 @@ function tierClass(tier: string) {
           <h1 class="title">海外新闻视频工厂</h1>
         </div>
         <div class="actions">
+          <el-button @click="flowCardMode = flowCardMode === 'compact' ? 'detail' : 'compact'">
+            卡片：{{ flowCardMode === 'compact' ? '简洁' : '详细' }}
+          </el-button>
           <el-button class="btn-green" type="primary" :loading="chatStore.ingestLoading" @click="chatStore.runIngest()">
             抓取新闻
           </el-button>
@@ -321,8 +645,19 @@ function tierClass(tier: string) {
         <aside class="left-panel">
           <div class="candidates">
             <div class="section-bar">
-              <span class="section-title">候选</span>
-              <span class="section-sub">美东当日热点优先 · 点击一键渲染</span>
+              <div class="section-head">
+                <span class="section-title">候选</span>
+                <span class="section-sub">美东当日热点优先 · 点击一键渲染</span>
+              </div>
+              <el-button
+                size="small"
+                class="translate-btn"
+                :loading="chatStore.translatingCandidates"
+                :disabled="!chatStore.lastCandidates?.length"
+                @click="chatStore.translateCurrentCandidatesToZh()"
+              >
+                转为中文
+              </el-button>
             </div>
             <div v-if="chatStore.lastCandidates?.length" class="candidate-list">
               <div v-for="c in chatStore.lastCandidates" :key="c.index" class="candidate-card">
@@ -337,11 +672,8 @@ function tierClass(tier: string) {
                 <div class="candidate-actions">
                   <span class="src">
                     {{ c.source }}
-                    <span v-if="c.heat_index != null"> · 热度指数 {{ c.heat_index }}</span>
-                    <span v-else-if="c.score_10 != null"> · 热度 {{ c.score_10 }}</span>
-                    <span v-if="c.rank_score_10 != null"> · 综合 {{ c.rank_score_10 }}</span>
-                    <span v-if="c.source_weight != null"> · 来源权重 {{ c.source_weight }}</span>
-                    <span v-if="c.recency_score_10 != null"> · 时效 {{ c.recency_score_10 }}</span>
+                    <span v-if="c.heat_index != null"> · 🔥{{ c.heat_index }}</span>
+                    <span v-else-if="c.score_10 != null"> · 🔥{{ c.score_10 }}</span>
                   </span>
                   <div class="candidate-actions-right">
                     <span class="tier" :class="tierClass(c.tier)">{{ c.tier }}</span>
@@ -470,12 +802,170 @@ function tierClass(tier: string) {
                   >
                     <pre class="artifact-pre">{{ item.content }}</pre>
                   </div>
+                  <div v-else-if="isFlowCardMessage(item)" class="bubble is-bot flow-card-bubble">
+                    <div class="flow-card-head">
+                      <div class="flow-card-title">
+                        <span class="flow-icon">{{ flowIconByTag(parseFlowCard(item.content)?.desc) }}</span>
+                        <span>{{ parseFlowCard(item.content)?.title }}</span>
+                      </div>
+                    </div>
+                    <ul v-if="parseFlowCard(item.content)?.items?.length" class="flow-card-list">
+                      <li
+                        v-for="(line, fi) in displayLines(parseFlowCard(item.content)?.items || [], 3)"
+                        :key="`${item.id}-f-${fi}`"
+                      >
+                        {{ line }}
+                      </li>
+                    </ul>
+                  </div>
+                  <div
+                    v-else-if="isAssetCandidateMessage(item)"
+                    class="bubble is-bot asset-candidates-bubble"
+                  >
+                    <div class="asset-candidates-title-row">
+                      <div class="asset-candidates-title"><span class="flow-icon">🖼️</span>素材候选（请选择要使用的素材）</div>
+                      <button class="asset-submit-btn ghost" type="button" @click="toggleAllAssets(item.id, item.content)">
+                        {{
+                          parseAssetCandidates(item.content).length > 0 &&
+                          parseAssetCandidates(item.content).every((x) => (pickedAssetMap[item.id] || []).includes(x.index))
+                            ? '取消全选'
+                            : '一键全选'
+                        }}
+                      </button>
+                    </div>
+                    <div class="asset-candidates-list">
+                      <div
+                        v-for="cand in parseAssetCandidates(item.content)"
+                        :key="`${cand.index}-${cand.url}`"
+                        class="asset-candidate-card"
+                        :class="(pickedAssetMap[item.id] || []).includes(cand.index) ? 'is-selected' : ''"
+                        @click="toggleAssetPick(item.id, cand.index)"
+                      >
+                        <span class="asset-candidate-badge">#{{ cand.index }}</span>
+                        <span class="asset-type-chip">{{ cand.type === 'video' ? '视频' : '图片' }}</span>
+                        <img v-if="cand.type === 'image'" class="asset-preview-image" :src="cand.url" alt="候选素材预览" />
+                        <video v-else class="asset-preview-video" :src="cand.url" controls preload="metadata" />
+                      </div>
+                    </div>
+                    <div class="asset-candidate-actions">
+                      <button class="asset-submit-btn" type="button" @click="submitPickedAssets(item.id)">确认所选素材</button>
+                      <button
+                        class="asset-submit-btn ghost"
+                        type="button"
+                        :disabled="!(pickedAssetMap[item.id] || []).length"
+                        @click="onPickAssetByIndex((pickedAssetMap[item.id] || [])[0])"
+                      >
+                        仅选第一项快速继续
+                      </button>
+                    </div>
+                  </div>
+                  <div v-else-if="isSubtitleStepMessage(item)" class="bubble is-bot subtitle-editor-bubble">
+                    <div class="flow-card-head">
+                      <div class="flow-card-title"><span class="flow-icon">📝</span>{{ firstLine(item.content) }}</div>
+                    </div>
+                    <ul v-if="parseSubtitlePreviewLines(item.content).length" class="flow-card-list">
+                      <li
+                        v-for="(line, si) in displayLines(parseSubtitlePreviewLines(item.content), 4)"
+                        :key="`${item.id}-s-${si}`"
+                      >
+                        {{ line }}
+                      </li>
+                    </ul>
+                    <textarea
+                      class="subtitle-editor"
+                      :value="subtitleDraftFor(item)"
+                      placeholder="每行一条字幕，可直接修改"
+                      @input="subtitleDraftMap[item.id] = ($event.target as HTMLTextAreaElement).value"
+                    />
+                    <div class="subtitle-actions">
+                      <button class="asset-submit-btn" type="button" @click="onSaveSubtitles(item)">保存字幕</button>
+                      <button class="asset-submit-btn ghost" type="button" @click="onQuickSend('确认字幕')">确认字幕并生成音频</button>
+                    </div>
+                  </div>
+                  <div v-else-if="isAudioStepMessage(item)" class="bubble is-bot media-result-bubble">
+                    <div class="flow-card-head">
+                      <div class="flow-card-title"><span class="flow-icon">🎧</span>{{ firstLine(item.content) }}</div>
+                    </div>
+                    <ul v-if="compactBodyLines(item.content).length" class="flow-card-list">
+                      <li
+                        v-for="(line, ai) in displayLines(compactBodyLines(item.content), 4)"
+                        :key="`${item.id}-a-${ai}`"
+                      >
+                        {{ line }}
+                      </li>
+                    </ul>
+                    <audio v-if="parseAudioPreviewUrl(item.content)" class="inline-audio" :src="parseAudioPreviewUrl(item.content)" controls />
+                    <div class="subtitle-actions">
+                      <button class="asset-submit-btn ghost" type="button" @click="onQuickSend('确认音频')">确认音频并合成视频</button>
+                    </div>
+                  </div>
+                  <div v-else-if="isTimelineStepMessage(item)" class="bubble is-bot media-result-bubble timeline-result-bubble">
+                    <div class="timeline-head">
+                      <div class="timeline-title"><span class="flow-icon">⏱️</span>{{ parseTimelineSummary(item.content).title }}</div>
+                      <div v-if="parseTimelineSummary(item.content).countText" class="timeline-count">
+                        {{ parseTimelineSummary(item.content).countText }}
+                      </div>
+                    </div>
+                    <div v-if="parseTimelineSummary(item.content).previews.length" class="timeline-preview-wrap">
+                      <div class="timeline-preview-title">字幕预览</div>
+                      <ol class="timeline-preview-list">
+                        <li
+                          v-for="(line, li) in displayLines(parseTimelineSummary(item.content).previews, 3)"
+                          :key="`${item.id}-pv-${li}`"
+                        >
+                          {{ line }}
+                        </li>
+                      </ol>
+                    </div>
+                    <div class="timeline-next">{{ parseTimelineSummary(item.content).nextStep }}</div>
+                    <div class="subtitle-actions">
+                      <button class="asset-submit-btn ghost" type="button" @click="onQuickSend('生成音频')">继续生成音频</button>
+                    </div>
+                  </div>
+                  <div v-else-if="isVideoStepMessage(item)" class="bubble is-bot media-result-bubble">
+                    <div class="flow-card-head">
+                      <div class="flow-card-title"><span class="flow-icon">🎬</span>{{ firstLine(item.content) }}</div>
+                    </div>
+                    <ul v-if="compactBodyLines(item.content).length" class="flow-card-list">
+                      <li
+                        v-for="(line, vi) in displayLines(compactBodyLines(item.content), 4)"
+                        :key="`${item.id}-v-${vi}`"
+                      >
+                        {{ line }}
+                      </li>
+                    </ul>
+                    <video
+                      v-if="parseVideoPreviewUrl(item.content)"
+                      class="inline-video"
+                      :src="parseVideoPreviewUrl(item.content)"
+                      controls
+                      preload="metadata"
+                    />
+                    <div class="subtitle-actions">
+                      <a
+                        v-if="parseVideoDownloadUrl(item.content)"
+                        class="asset-submit-btn ghost"
+                        :href="parseVideoDownloadUrl(item.content)"
+                        target="_blank"
+                        rel="noreferrer"
+                        download
+                        >下载视频</a
+                      >
+                    </div>
+                  </div>
                   <div v-else class="bubble" :class="item.role === 'user' ? 'is-user' : 'is-bot'">
                     <p v-if="item.role === 'user'" class="text">{{ item.content }}</p>
                     <p v-else class="text plain-rich">
                       <template v-for="(seg, si) in assistantSegments(item)" :key="si">
                         <span v-if="seg.type === 'index'" class="seg-index">{{ seg.text }}</span>
                         <span v-else-if="seg.type === 'source'" class="seg-source">{{ seg.text }}</span>
+                        <a
+                          v-else-if="seg.type === 'link'"
+                          class="seg-link"
+                          :href="seg.text.includes('|||') ? seg.text.split('|||')[1] : seg.text"
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          >{{ seg.text.includes('|||') ? seg.text.split('|||')[0] : seg.text }}</a>
                         <span v-else>{{ seg.text }}</span>
                       </template>
                     </p>
@@ -498,7 +988,14 @@ function tierClass(tier: string) {
           </div>
 
           <div class="quick">
-            <button v-for="q in QUICK_COMMANDS" :key="q.text" type="button" class="chip" @click="onQuickSend(q.text)">
+            <button
+              v-for="q in QUICK_COMMANDS"
+              :key="q.text"
+              type="button"
+              class="chip"
+              :class="q.kind === 'flow' ? 'chip-flow' : ''"
+              @click="onQuickSend(q.text)"
+            >
               {{ q.label }}
             </button>
             <template v-if="artifactQuickItems.length">
@@ -871,7 +1368,7 @@ function tierClass(tier: string) {
   border: 1px solid #3a404a;
   border-radius: 14px;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   overflow-x: hidden;
   background: #262a31;
   display: grid;
@@ -880,8 +1377,8 @@ function tierClass(tier: string) {
 }
 
 .job-tools {
-  margin: 10px;
-  padding: 10px;
+  margin: 8px 10px 6px;
+  padding: 8px 10px;
 }
 
 .job-tools-title {
@@ -915,9 +1412,35 @@ function tierClass(tier: string) {
 
 .section-bar {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.section-head {
+  min-width: 0;
+  display: flex;
   align-items: baseline;
   gap: 10px;
-  margin-bottom: 10px;
+}
+
+.translate-btn {
+  --el-button-bg-color: #3a4453;
+  --el-button-border-color: #556172;
+  --el-button-text-color: #e7edf6;
+  --el-button-hover-bg-color: #465265;
+  --el-button-hover-border-color: #6a7890;
+  --el-button-active-bg-color: #333d4b;
+  --el-button-active-border-color: #4f5a6b;
+  --el-button-disabled-bg-color: #2d343f;
+  --el-button-disabled-border-color: #434d5b;
+  --el-button-disabled-text-color: #7d8796;
+  border-radius: 999px;
+  padding-inline: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.22);
 }
 
 .section-title {
@@ -1246,65 +1769,439 @@ function tierClass(tier: string) {
   font-weight: 600;
 }
 
+.seg-link {
+  color: inherit;
+  font-weight: inherit;
+  text-decoration: none;
+  word-break: break-all;
+  cursor: pointer;
+}
+
+.seg-link:hover {
+  color: inherit;
+}
+
+.flow-card-bubble {
+  width: min(720px, 100%);
+  border-radius: 14px;
+  border: 1px solid rgba(125, 211, 252, 0.34);
+  background: linear-gradient(165deg, #283446 0%, #202a39 100%);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
+.flow-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.flow-card-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #eef6ff;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.flow-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.flow-card-tag {
+  font-size: 11px;
+  color: #cfe5ff;
+  border: 1px solid rgba(96, 165, 250, 0.55);
+  background: rgba(15, 23, 42, 0.45);
+  border-radius: 4px;
+  padding: 2px 8px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.flow-card-tag-solid {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.75), rgba(59, 130, 246, 0.75));
+  border-color: rgba(147, 197, 253, 0.72);
+  color: #f8fbff;
+}
+
+.flow-card-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.asset-candidates-bubble {
+  width: min(760px, 100%);
+  border-radius: 14px;
+  border: 1px solid #4a5261;
+  background: linear-gradient(180deg, #323a47 0%, #2a313d 100%);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
+.asset-candidates-title {
+  font-size: 14px;
+  font-weight: 800;
+  margin-bottom: 10px;
+  color: #f1f5f9;
+  letter-spacing: 0.01em;
+}
+
+.asset-candidates-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.asset-candidates-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.asset-candidate-card {
+  border: 1px solid #505a6b;
+  border-radius: 12px;
+  padding: 6px;
+  background: linear-gradient(180deg, #2f3744 0%, #29313c 100%);
+  transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+  cursor: pointer;
+  position: relative;
+}
+
+.asset-candidate-card:has(.asset-preview-image) {
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.asset-candidate-card:has(.asset-preview-video) {
+  border-color: rgba(167, 139, 250, 0.5);
+}
+
+.asset-candidate-card:hover {
+  transform: translateY(-1px);
+  border-color: #64748b;
+  box-shadow: 0 10px 18px rgba(0, 0, 0, 0.24);
+}
+
+.asset-candidate-card.is-selected {
+  border-color: #8b5cf6;
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.35), 0 10px 18px rgba(0, 0, 0, 0.24);
+}
+
+.asset-candidate-badge {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  z-index: 2;
+  font-size: 11px;
+  color: #f8fafc;
+  font-weight: 700;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.asset-type-chip {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  z-index: 2;
+  font-size: 11px;
+  color: #e2e8f0;
+  background: rgba(30, 41, 59, 0.65);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.asset-preview-image,
+.asset-preview-video {
+  width: 100%;
+  height: 128px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: #000;
+}
+
+.asset-preview-image {
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.25);
+}
+
+.asset-preview-video {
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.3);
+}
+
+.asset-candidate-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.asset-submit-btn {
+  border: 1px solid #64748b;
+  background: linear-gradient(135deg, #5b3a78, #4b3560);
+  color: #f8fafc;
+  border-radius: 999px;
+  padding: 5px 13px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.asset-submit-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: #8b5cf6;
+}
+
+.asset-submit-btn.ghost {
+  background: #33404d;
+  color: #e2e8f0;
+}
+
+.asset-submit-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.subtitle-editor-bubble,
+.media-result-bubble {
+  width: min(680px, 100%);
+  border-radius: 14px;
+  border: 1px solid #4a5261;
+  background: linear-gradient(180deg, #313947 0%, #2a313d 100%);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
+.timeline-result-bubble {
+  display: grid;
+  gap: 10px;
+}
+
+.timeline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.timeline-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #eff6ff;
+}
+
+.timeline-count {
+  font-size: 12px;
+  color: #dbeafe;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  background: rgba(37, 99, 235, 0.2);
+}
+
+.timeline-preview-wrap {
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: rgba(15, 23, 42, 0.26);
+}
+
+.timeline-preview-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #cbd5e1;
+  margin-bottom: 5px;
+}
+
+.timeline-preview-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.timeline-next {
+  font-size: 12px;
+  color: #c7f9cc;
+  border-left: 3px solid rgba(74, 222, 128, 0.75);
+  padding-left: 8px;
+}
+
+.subtitle-editor-bubble .text,
+.media-result-bubble .text {
+  color: #e8edf6;
+}
+
+.subtitle-editor {
+  width: 100%;
+  min-height: 120px;
+  margin-top: 8px;
+  border-radius: 8px;
+  border: 1px solid #4a515d;
+  background: #1f2530;
+  color: #edf2f7;
+  padding: 10px;
+  resize: vertical;
+  line-height: 1.6;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.6) rgba(15, 23, 42, 0.2);
+}
+
+.subtitle-editor::-webkit-scrollbar {
+  width: 8px;
+}
+
+.subtitle-editor::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: linear-gradient(180deg, rgba(148, 163, 184, 0.8), rgba(100, 116, 139, 0.8));
+}
+
+.pipe-body {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.6) rgba(15, 23, 42, 0.24);
+}
+
+.pipe-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.pipe-body::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: linear-gradient(180deg, rgba(148, 163, 184, 0.8), rgba(100, 116, 139, 0.8));
+}
+
+.subtitle-actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.inline-audio {
+  width: 100%;
+  margin-top: 10px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #1f2b3a, #223145);
+  padding: 8px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+}
+
+.inline-video {
+  width: 100%;
+  max-height: 420px;
+  margin-top: 10px;
+  border-radius: 8px;
+  background: #000;
+  border: 1px solid rgba(167, 139, 250, 0.45);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
+}
+
 .pipeline-bubble {
+  --pipe-accent: #94a3b8;
+  --pipe-glow: rgba(148, 163, 184, 0.26);
   padding: 0;
   overflow: hidden;
   border-radius: 14px;
-  border: 1px solid #434a56;
-  background: #303742;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: linear-gradient(165deg, #293241 0%, #202735 100%);
   max-width: 100%;
+  box-shadow: 0 12px 28px rgba(7, 12, 20, 0.42);
+  transition:
+    transform 0.16s ease,
+    box-shadow 0.16s ease,
+    border-color 0.16s ease;
+}
+
+.pipeline-bubble:hover {
+  transform: translateY(-1px);
+  border-color: var(--pipe-accent);
+  box-shadow:
+    0 14px 32px rgba(7, 12, 20, 0.48),
+    0 0 0 1px rgba(255, 255, 255, 0.03) inset;
 }
 
 .pipeline-bubble[data-accent='slate'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #94a3b8;
+  --pipe-glow: rgba(148, 163, 184, 0.24);
 }
 .pipeline-bubble[data-accent='violet'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #a78bfa;
+  --pipe-glow: rgba(167, 139, 250, 0.24);
 }
 .pipeline-bubble[data-accent='amber'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #fbbf24;
+  --pipe-glow: rgba(251, 191, 36, 0.24);
 }
 .pipeline-bubble[data-accent='emerald'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #34d399;
+  --pipe-glow: rgba(52, 211, 153, 0.24);
 }
 .pipeline-bubble[data-accent='sky'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #38bdf8;
+  --pipe-glow: rgba(56, 189, 248, 0.24);
 }
 .pipeline-bubble[data-accent='rose'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #fb7185;
+  --pipe-glow: rgba(251, 113, 133, 0.24);
 }
 .pipeline-bubble[data-accent='cyan'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #22d3ee;
+  --pipe-glow: rgba(34, 211, 238, 0.24);
 }
 .pipeline-bubble[data-accent='fuchsia'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #e879f9;
+  --pipe-glow: rgba(232, 121, 249, 0.24);
 }
 .pipeline-bubble[data-accent='orange'] {
-  border-color: #49515f;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  --pipe-accent: #fb923c;
+  --pipe-glow: rgba(251, 146, 60, 0.24);
 }
 
 .pipe-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
   padding: 10px 12px;
-  background: linear-gradient(90deg, #3a424f, #313946);
-  border-bottom: 1px solid #444c59;
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0)),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.62), rgba(30, 41, 59, 0.5));
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
 }
 
 .pipe-icon {
-  font-size: 22px;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 16px;
   line-height: 1;
   flex-shrink: 0;
+  background: var(--pipe-glow);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.14) inset;
 }
 
 .pipe-head-text {
@@ -1312,9 +2209,9 @@ function tierClass(tier: string) {
 }
 
 .pipe-kicker {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
-  color: #aab3c0;
+  color: #c7d2e0;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -1322,20 +2219,22 @@ function tierClass(tier: string) {
 .pipe-title {
   font-size: 14px;
   font-weight: 800;
-  color: #e8ecf3;
+  color: #eef5ff;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
 }
 
 .pipe-body {
   margin: 0;
-  padding: 12px 14px 14px;
+  padding: 12px 13px 13px;
   font-family: ui-sans-serif, system-ui, sans-serif;
   font-size: 13px;
-  line-height: 1.55;
-  color: #d7dde7;
+  line-height: 1.58;
+  color: #e4ecf8;
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 320px;
   overflow-y: auto;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0));
 }
 
 .quick {
@@ -1363,6 +2262,18 @@ function tierClass(tier: string) {
   border-color: #6a7484;
   color: #f2f5f9;
   background: #394150;
+}
+
+.chip-flow {
+  border-color: #6a7484;
+  background: #3f2f4f;
+  color: #f3e8ff;
+}
+
+.chip-flow:hover {
+  border-color: #8b5cf6;
+  background: #4b3560;
+  color: #faf5ff;
 }
 
 .quick-sep {
@@ -1605,6 +2516,15 @@ function tierClass(tier: string) {
   }
   .right-panel {
     grid-template-rows: 360px auto auto;
+  }
+  .asset-candidates-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .asset-candidates-list {
+    grid-template-columns: 1fr;
   }
 }
 </style>
