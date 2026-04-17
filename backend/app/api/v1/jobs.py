@@ -29,6 +29,37 @@ from app.services.tts_stub import synthesize_narration
 router = APIRouter(tags=["jobs"])
 
 
+async def _resolve_render_duration_sec(
+    session: AsyncSession, job_id: int, au: AudioOutput | None, job: VideoJob
+) -> float:
+    """优先按字幕时间轴 end，其次按配音文件时长，最后才用任务上的目标时长。"""
+    r_tl = await session.execute(
+        select(SubtitleTimeline)
+        .where(SubtitleTimeline.job_id == job_id)
+        .order_by(SubtitleTimeline.id.desc())
+        .limit(1)
+    )
+    st = r_tl.scalar_one_or_none()
+    if st and (st.timeline_json or "").strip():
+        try:
+            cues = json.loads(st.timeline_json)
+            ends: list[float] = []
+            for x in cues or []:
+                if isinstance(x, dict) and x.get("end") is not None:
+                    try:
+                        ends.append(float(x["end"]))
+                    except (TypeError, ValueError):
+                        continue
+            if ends:
+                return max(10.0, min(max(ends) + 0.45, 120.0))
+        except Exception:
+            pass
+    if au and au.duration_sec and float(au.duration_sec) > 0:
+        return max(10.0, min(float(au.duration_sec) + 0.35, 120.0))
+    jd = float(job.duration_sec or 18)
+    return max(10.0, min(jd, 90.0))
+
+
 class RerenderRequest(BaseModel):
     instruction: str | None = None
     duration_sec: int | None = None
@@ -37,6 +68,7 @@ class RerenderRequest(BaseModel):
     prefer_video_assets: bool | None = None
     subtitle_tone: str | None = None
     tts_voice: str | None = None
+    aspect_ratio: str | None = None
 
 
 class TtsPreviewRequest(BaseModel):
@@ -73,7 +105,7 @@ def _script_to_narration_text(payload: dict) -> str:
 @router.post("/jobs/from-candidate")
 async def create_job_from_candidate(
     index: int = Query(..., ge=1),
-    duration_sec: int = 35,
+    duration_sec: int = 18,
     style: str | None = None,
     session: AsyncSession = Depends(get_db),
 ):
@@ -111,6 +143,14 @@ async def trigger_pipeline(
 ):
     # 每次触发新任务前先清理历史卡死任务，避免旧任务长期占据中间态。
     await recover_stuck_jobs(session, stale_minutes=8)
+    job = await session.get(VideoJob, job_id)
+    if not job:
+        raise HTTPException(404, "job 不存在")
+    # 先落库为「正文抽取」，避免异步任务尚未调度时前端仍看到 ready_for_review 误以为没触发
+    job.failed_stage = None
+    job.error_message = None
+    job.status = JobStatus.extracting_content.value
+    await session.commit()
     background_tasks.add_task(_run_pipeline_bg, job_id)
     return {"ok": True, "job_id": job_id, "note": "管线异步执行，请轮询 GET /jobs/{id} 或 GET /jobs/{id}/detail"}
 
@@ -123,6 +163,14 @@ async def trigger_rerender(
     session: AsyncSession = Depends(get_db),
 ):
     await recover_stuck_jobs(session, stale_minutes=8)
+    job = await session.get(VideoJob, job_id)
+    if not job:
+        raise HTTPException(404, "job 不存在")
+    # 先落库为「正文抽取」，避免 BackgroundTasks 尚未执行时前端轮询仍读到 ready_for_review
+    job.failed_stage = None
+    job.error_message = None
+    job.status = JobStatus.extracting_content.value
+    await session.commit()
     options = body.model_dump(exclude_none=True)
     background_tasks.add_task(_run_pipeline_bg_with_options, job_id, options)
     return {
@@ -153,6 +201,7 @@ async def preview_tts_voice(body: TtsPreviewRequest):
 async def upload_job_assets(
     job_id: int,
     files: list[UploadFile] = File(...),
+    replace_existing: bool = Query(False),
     session: AsyncSession = Depends(get_db),
 ):
     job = await session.get(VideoJob, job_id)
@@ -165,6 +214,21 @@ async def upload_job_assets(
     save_dir.mkdir(parents=True, exist_ok=True)
     accepted = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".webm"}
     added: list[dict] = []
+
+    if replace_existing:
+        r_old = await session.execute(
+            select(JobAsset).where(
+                JobAsset.job_id == job_id,
+                JobAsset.asset_type.in_(["user_image", "user_video"]),
+            )
+        )
+        old_assets = list(r_old.scalars().all())
+        for a in old_assets:
+            meta = a.meta_json if isinstance(a.meta_json, dict) else {}
+            src = str(meta.get("from") or "").strip()
+            if src == "chat_upload":
+                await session.delete(a)
+        await session.flush()
 
     for f in files:
         ext = Path(f.filename or "").suffix.lower()
@@ -185,7 +249,7 @@ async def upload_job_assets(
                 job_id=job_id,
                 asset_type=asset_type,
                 local_path=str(p),
-                meta_json={"from": "chat_upload", "filename": f.filename},
+                meta_json={"from": "chat_upload", "filename": f.filename, "replace_batch": bool(replace_existing)},
             )
         )
         added.append({"name": f.filename, "asset_type": asset_type, "path": str(p)})
@@ -613,11 +677,12 @@ async def run_step_render(job_id: int, session: AsyncSession = Depends(get_db)):
     user_video_urls = [a.remote_url for a in assets if a.asset_type == "user_video" and a.remote_url]
     job_dir = settings.outputs_dir / f"job_{job_id}"
     narration_text = _script_to_narration_text(payload)
+    render_sec = await _resolve_render_duration_sec(session, job_id, au, job)
     video_path, preview_path = await render_video_stub(
         job_dir,
         {
             "script": payload,
-            "duration_sec": int(job.duration_sec or 18),
+            "duration_sec": render_sec,
             "source": "",
             "hero_image_url": item.hero_image_url,
             "page_screenshot_path": item.page_screenshot_path,

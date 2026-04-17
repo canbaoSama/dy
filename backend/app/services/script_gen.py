@@ -25,13 +25,15 @@ def _mock_script(
     point_b = snippet[90:180] if len(snippet) > 90 else ""
     point_c = snippet[180:270] if len(snippet) > 180 else ""
 
+    body_lines: list[str] = [f"{core}" if core else f"{title[:40]}"]
+    if point_b:
+        body_lines.append(point_b)
+    if point_c:
+        body_lines.append(point_c)
+
     return {
         "hook": f"{source_name or '海外媒体'}最新消息：{title[:28]}",
-        "body": [
-            f"{core}" if core else f"{title[:40]}",
-            f"{point_b}" if point_b else "目前公开信息仍在更新中。",
-            f"{point_c}" if point_c else "后续以官方与原文更新为准。",
-        ],
+        "body": body_lines,
         "ending": "以上是这条新闻的最新进展。",
         "titles": [
             f"{title[:28]}",

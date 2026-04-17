@@ -227,7 +227,6 @@ async def run_job_pipeline(session: AsyncSession, job_id: int, options: dict | N
             select(JobAsset).where(
                 JobAsset.job_id == job.id,
                 JobAsset.asset_type.in_(["user_image", "user_video"]),
-                JobAsset.local_path.is_not(None),
             )
         )
         user_assets = list(r_user_assets.scalars().all())
@@ -235,11 +234,14 @@ async def run_job_pipeline(session: AsyncSession, job_id: int, options: dict | N
         user_video_paths = [a.local_path for a in user_assets if a.asset_type == "user_video" and a.local_path]
         user_video_urls = [a.remote_url for a in user_assets if a.asset_type == "user_video" and a.remote_url]
 
+        # 成片时长应与配音实际长度一致；target_duration 仅用于脚本/口播压缩目标，不能拿来裁视频。
+        video_duration_sec = max(10.0, min(float(duration_sec) + 0.4, 90.0))
+
         video_path, preview_path = await render_video_stub(
             job_dir,
             {
                 "script": payload,
-                "duration_sec": target_duration,
+                "duration_sec": video_duration_sec,
                 "source": item.source.name if item.source else "",
                 "hero_image_url": item.hero_image_url,
                 "page_screenshot_path": item.page_screenshot_path,
@@ -254,6 +256,7 @@ async def run_job_pipeline(session: AsyncSession, job_id: int, options: dict | N
                 "must_use_uploaded_assets": bool(opts.get("must_use_uploaded_assets", False)),
                 "prefer_video_assets": bool(opts.get("prefer_video_assets", False)),
                 "subtitle_tone": str(opts.get("subtitle_tone") or "").strip() or None,
+                "aspect_ratio": str(opts.get("aspect_ratio") or "").strip() or "9:16",
             },
         )
         published_latest = _publish_latest_video(job.id, video_path)

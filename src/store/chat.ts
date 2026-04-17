@@ -24,6 +24,8 @@ interface ChatState {
   ingestLoading: boolean
   translatingCandidates: boolean
   lastCandidates: NonNullable<CommandResponse['candidates']> | null
+  /** 递增后让 JobStatusPanel 在「已结束」状态下仍短暂轮询，捕捉重跑/多步命令触发的状态变化 */
+  pipelineResumeNonce: number
 }
 
 function splitAssistantReply(reply: string): string[] {
@@ -67,6 +69,7 @@ export const useChatStore = defineStore('chat', {
     ingestLoading: false,
     translatingCandidates: false,
     lastCandidates: null,
+    pipelineResumeNonce: 0,
   }),
 
   actions: {
@@ -81,6 +84,7 @@ export const useChatStore = defineStore('chat', {
             content: res.reply,
             createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
           })
+          this.bumpPipelineResume()
         } catch (e) {
           this.messages.push({
             id: uuidv4(),
@@ -94,11 +98,25 @@ export const useChatStore = defineStore('chat', {
     },
 
     clear() {
+      for (const m of this.messages) {
+        for (const u of m.uploadPreviews || []) {
+          try {
+            URL.revokeObjectURL(u.objectUrl)
+          } catch {
+            /* ignore */
+          }
+        }
+      }
       this.messages = []
       this.lastCandidates = null
       this.activeJobId = null
       this.jobHistory = []
       this.jobStatusMap = {}
+      this.pipelineResumeNonce = 0
+    },
+
+    bumpPipelineResume() {
+      this.pipelineResumeNonce += 1
     },
 
     setActiveJobId(id: number | null) {
@@ -261,9 +279,10 @@ export const useChatStore = defineStore('chat', {
           this.messages.push({
             id: uuidv4(),
             role: 'assistant',
-            content: `已记录${field}修改并触发重生成任务 #${this.activeJobId}，请稍候查看最新结果。`,
+            content: `已记录${field}修改并触发重生成任务 #${this.activeJobId}；右侧 Pipeline 将刷新，完成后对话内会有新视频消息。`,
             createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
           })
+          this.bumpPipelineResume()
           return
         }
         if (this.activeJobId != null && /^重新生成|^重生成/.test(text)) {
@@ -272,9 +291,10 @@ export const useChatStore = defineStore('chat', {
           this.messages.push({
             id: uuidv4(),
             role: 'assistant',
-            content: `已按新需求重生成任务 #${this.activeJobId}，请稍候查看最新成片。`,
+            content: `已按新需求重生成任务 #${this.activeJobId}；右侧 Pipeline 将刷新，完成后对话内会有新视频消息。`,
             createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
           })
+          this.bumpPipelineResume()
           return
         }
         const res = await postCommand(text, this.activeJobId)
@@ -338,7 +358,14 @@ export const useChatStore = defineStore('chat', {
       }
     },
 
-    async uploadAssets(files: File[]) {
+    async uploadAssets(
+      files: File[],
+      opts?: {
+        previews?: Array<{ name: string; objectUrl: string; media: 'image' | 'video' }>
+        silentMessage?: boolean
+        replaceExisting?: boolean
+      },
+    ) {
       if (!files.length) return
       if (this.activeJobId == null) {
         ElMessage.warning('请先选择或创建任务，再上传素材')
@@ -346,13 +373,17 @@ export const useChatStore = defineStore('chat', {
       }
       this.loading = true
       try {
-        const r = await uploadJobAssets(this.activeJobId, files)
-        this.messages.push({
-          id: uuidv4(),
-          role: 'assistant',
-          content: `已上传 ${r.added} 个素材到任务 #${this.activeJobId}，可直接重新点“渲染”或触发流水线。`,
-          createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-        })
+        const r = await uploadJobAssets(this.activeJobId, files, { replaceExisting: opts?.replaceExisting })
+        if (!opts?.silentMessage) {
+          this.messages.push({
+            id: uuidv4(),
+            role: 'assistant',
+            content: `已上传 ${r.added} 个素材到任务 #${this.activeJobId}。可在下方预览；点素材卡片「确认所选素材并继续」或右侧「应用并重跑」重新出片。`,
+            createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+            uploadPreviews: opts?.previews?.length ? opts.previews : undefined,
+          })
+        }
+        this.bumpPipelineResume()
       } catch (e) {
         ElMessage.error(formatChatError(e))
       } finally {
@@ -368,6 +399,7 @@ export const useChatStore = defineStore('chat', {
       prefer_video_assets?: boolean
       subtitle_tone?: string
       tts_voice?: string
+      aspect_ratio?: '9:16' | '16:9'
     }) {
       if (this.activeJobId == null) {
         ElMessage.warning('请先选择任务')
@@ -379,11 +411,36 @@ export const useChatStore = defineStore('chat', {
         this.messages.push({
           id: uuidv4(),
           role: 'assistant',
-          content: `已按配置重生成任务 #${this.activeJobId}，请稍候查看最新视频。`,
+          content: `已按配置重生成任务 #${this.activeJobId}，流水线已在后台启动；右侧 Pipeline 会刷新状态，完成后对话里会出现新的「视频合成完成」。`,
           createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
         })
+        this.bumpPipelineResume()
       } catch (e) {
         ElMessage.error(formatChatError(e))
+      } finally {
+        this.loading = false
+      }
+    },
+
+    /** 连续执行若干聊天命令（不插入用户气泡），用于对话框内「确定并成片」等一键流程 */
+    async runAssistantCommands(jobId: number, steps: string[]) {
+      if (!steps.length) return
+      this.loading = true
+      this.bumpPipelineResume()
+      try {
+        for (let i = 0; i < steps.length; i++) {
+          const step = steps[i]
+          const res = await postCommand(step, jobId)
+          if (res.active_job_id != null) this.activeJobId = res.active_job_id
+          if (Array.isArray(res.candidates)) {
+            this.lastCandidates = res.candidates.length > 0 ? res.candidates : null
+          }
+          this.appendAssistantReply(res.reply)
+          this.bumpPipelineResume()
+        }
+      } catch (e) {
+        ElMessage.error(formatChatError(e))
+        throw e
       } finally {
         this.loading = false
       }

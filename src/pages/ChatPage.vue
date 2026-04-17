@@ -8,7 +8,7 @@ import { AGENT_NAME } from '@/config/app'
 import { QUICK_COMMANDS } from '@/constants/commands'
 import { PIPELINE_STAGES, pipelineStageIndex, pipelineStageUi } from '@/constants/pipeline'
 import { TTS_VOICE_OPTIONS } from '@/constants/tts'
-import { previewTtsVoice, updateLatestSubtitles } from '@/api/factory'
+import { fetchJobDetail, postCommand, previewTtsVoice, updateLatestSubtitles } from '@/api/factory'
 import { useChatStore } from '@/store/chat'
 import type { ChatMessage } from '@/types/chat'
 import type { JobDetailResponse } from '@/types/job'
@@ -23,6 +23,8 @@ const lastJobDetail = ref<JobDetailResponse | null>(null)
 const lastPollStatus = ref<Record<number, string | undefined>>({})
 /** 各任务已推送过的阶段，防止重复补发 */
 const pushedStages = ref<Record<number, string[]>>({})
+/** 主对话区独立轮询 generation；递增后旧轮询立即退出 */
+const jobDetailPollGen = ref(0)
 const input = ref('')
 const listRef = ref<HTMLElement | null>(null)
 const uploadRef = ref<HTMLInputElement | null>(null)
@@ -30,12 +32,9 @@ const rerenderForm = reactive({
   duration_sec: 18,
   subtitle_tone: 'brief',
   tts_voice: 'zh-CN-XiaoxiaoNeural',
+  aspect_ratio: '9:16' as '9:16' | '16:9',
   must_use_uploaded_assets: false,
   prefer_video_assets: true,
-  title_edit: '',
-  intro_edit: '',
-  subtitle_edit: '',
-  material_edit: '',
 })
 
 const canSend = computed(() => input.value.trim().length > 0 && !chatStore.loading)
@@ -45,6 +44,24 @@ let previewAudio: HTMLAudioElement | null = null
 const flowCardMode = ref<'compact' | 'detail'>('compact')
 const pickedAssetMap = ref<Record<string, number[]>>({})
 const subtitleDraftMap = ref<Record<string, string>>({})
+const uploadPreviewMap = ref<Record<string, Array<{ name: string; objectUrl: string; media: 'image' | 'video' }>>>({})
+const activeAssetCardId = ref<string | null>(null)
+const pendingUploadMap = ref<
+  Record<string, Array<{ id: string; name: string; objectUrl: string; media: 'image' | 'video'; file: File }>>
+>({})
+const pickedUploadMap = ref<Record<string, string[]>>({})
+const SLASH_COMMANDS = [
+  {
+    command: '/sucai',
+    description: '在对话中加载素材候选，可勾选/上传后一键重新成片',
+    template: '/sucai ',
+  },
+  {
+    command: '/zimu',
+    description: '在对话中打开上一条字幕并编辑，确定后重新成片',
+    template: '/zimu ',
+  },
+] as const
 const CHAT_OWNED_STAGES = new Set([
   'collecting_assets',
   'generating_subtitles',
@@ -66,6 +83,20 @@ const artifactQuickItems = computed(() => {
     { kind: 'videos' as const, label: '视频' },
   ] as const
 })
+
+const slashKeyword = computed(() => {
+  const t = input.value.trimStart()
+  if (!t.startsWith('/')) return ''
+  return t.slice(1).toLowerCase()
+})
+
+const slashCommandOptions = computed(() => {
+  const key = slashKeyword.value
+  if (!key) return [...SLASH_COMMANDS]
+  return SLASH_COMMANDS.filter((x) => x.command.slice(1).toLowerCase().includes(key))
+})
+
+const showSlashPanel = computed(() => input.value.trimStart().startsWith('/') && slashCommandOptions.value.length > 0)
 
 async function sendText(text: string) {
   const v = text.trim()
@@ -123,10 +154,42 @@ watch(
 )
 
 async function onSend() {
-  await sendText(input.value)
+  const raw = input.value.trim()
+  if (!raw) return
+  if (await handleSlashCommand(raw)) {
+    input.value = ''
+    return
+  }
+  await sendText(raw)
+}
+
+function pickSlashCommand(template: string) {
+  input.value = template
 }
 
 function onClear() {
+  for (const arr of Object.values(uploadPreviewMap.value)) {
+    for (const u of arr) {
+      try {
+        URL.revokeObjectURL(u.objectUrl)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  for (const arr of Object.values(pendingUploadMap.value)) {
+    for (const u of arr) {
+      try {
+        URL.revokeObjectURL(u.objectUrl)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  uploadPreviewMap.value = {}
+  pendingUploadMap.value = {}
+  pickedUploadMap.value = {}
+  jobDetailPollGen.value += 1
   // 保留 lastPollStatus，避免清空会话后下一轮轮询又把整条流水线重复推一遍
   chatStore.clear()
   pushedStages.value = {}
@@ -206,16 +269,12 @@ function parseAssetCandidates(text: string): Array<{ index: number; type: 'image
   return out
 }
 
-function parseAssetLeadSteps(text: string): string[] {
-  const rows = text
-    .split('\n')
-    .map((x) => x.trim())
-    .filter((x) => /^步骤\s*\d+\/\d+：/.test(x))
-  return rows.slice(0, 2)
-}
-
 function isAssetCandidateMessage(item: ChatMessage): boolean {
   return item.role === 'assistant' && item.content.includes('素材候选如下')
+}
+
+function isUploadPreviewMessage(item: ChatMessage): boolean {
+  return item.role === 'assistant' && Boolean(item.uploadPreviews?.length)
 }
 
 async function onPickAssetByIndex(index: number) {
@@ -230,19 +289,61 @@ function toggleAssetPick(messageId: string, index: number) {
 }
 
 async function submitPickedAssets(messageId: string) {
-  const picked = pickedAssetMap.value[messageId] || []
-  if (!picked.length) {
-    ElMessage.warning('请先选择至少一个素材')
+  const jid = chatStore.activeJobId
+  if (!jid) {
+    ElMessage.warning('请先选择任务')
     return
   }
-  await sendText(`选素材 ${picked.join(',')}`)
+  const picked = pickedAssetMap.value[messageId] || []
+  const pickedUploadIds = new Set(pickedUploadMap.value[messageId] || [])
+  const pendingUploads = pendingUploadMap.value[messageId] || []
+  const pickedUploads = pendingUploads.filter((x) => pickedUploadIds.has(x.id))
+  if (pendingUploads.length > 0 && pickedUploads.length === 0) {
+    ElMessage.warning('已上传素材未勾选，请先选择要使用的上传素材')
+    return
+  }
+  if (picked.length === 0 && pickedUploads.length === 0) {
+    ElMessage.warning('请先选择至少一个候选素材或上传附件')
+    return
+  }
+  if (pickedUploads.length > 0) {
+    await chatStore.uploadAssets(
+      pickedUploads.map((x) => x.file),
+      { silentMessage: true, replaceExisting: true },
+    )
+  }
+  try {
+    // “选素材”回包文案不含附件数量，这里手动执行并吞掉原始回包，统一由前端输出一条合并提示。
+    if (picked.length) {
+      const r = await postCommand(`选素材 ${picked.join(',')}`, jid)
+      if (r.active_job_id != null) chatStore.activeJobId = r.active_job_id
+    }
+    await chatStore.runAssistantCommands(jid, ['生成字幕'])
+    chatStore.appendAssistantMessage({
+      id: uuidv4(),
+      role: 'assistant',
+      content: `素材确认完成：候选 ${picked.length} 个，附件 ${pickedUploads.length} 个。字幕已生成，请按流程继续：确认字幕 -> 生成音频 -> 确认音频 -> 合成视频。`,
+      createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    })
+    uploadPreviewMap.value[messageId] = []
+    pendingUploadMap.value[messageId] = []
+    pickedUploadMap.value[messageId] = []
+    void scrollToBottom()
+  } catch {
+    /* runAssistantCommands 已提示 */
+  }
 }
 
 function toggleAllAssets(messageId: string, text: string) {
-  const all = parseAssetCandidates(text).map((x) => x.index)
-  const cur = new Set(pickedAssetMap.value[messageId] || [])
-  const isAll = all.length > 0 && all.every((x) => cur.has(x))
-  pickedAssetMap.value[messageId] = isAll ? [] : all
+  const remoteAll = parseAssetCandidates(text).map((x) => x.index)
+  const uploadAll = (pendingUploadMap.value[messageId] || []).map((x) => x.id)
+  const curRemote = new Set(pickedAssetMap.value[messageId] || [])
+  const curUpload = new Set(pickedUploadMap.value[messageId] || [])
+  const remoteAllSelected = remoteAll.length === 0 || remoteAll.every((x) => curRemote.has(x))
+  const uploadAllSelected = uploadAll.length === 0 || uploadAll.every((x) => curUpload.has(x))
+  const isAll = remoteAllSelected && uploadAllSelected && (remoteAll.length + uploadAll.length > 0)
+  pickedAssetMap.value[messageId] = isAll ? [] : remoteAll
+  pickedUploadMap.value[messageId] = isAll ? [] : uploadAll
 }
 
 function getApiOrigin() {
@@ -291,6 +392,16 @@ function parseSubtitlePreviewLines(text: string): string[] {
     .split('\n')
     .map((x) => x.replace(/^\-\s*/, '').trim())
     .filter(Boolean)
+}
+
+/** 与后端「生成字幕」回包格式一致，便于复用 isSubtitleStepMessage / parseSubtitlePreviewLines */
+function buildSubtitleStepReply(jobId: number, lines: string[]): string {
+  const preview = lines.map((x) => `- ${x}`).join('\n')
+  return (
+    `字幕步骤完成，任务：#${jobId}，共 ${lines.length} 条。\n` +
+    `字幕预览：\n${preview}\n` +
+    `你可以在对话框中直接编辑字幕并保存；确认后发送「确认字幕」继续。`
+  )
 }
 
 function firstLine(text: string): string {
@@ -391,6 +502,36 @@ function parseTimelineSummary(text: string): {
   }
 }
 
+/** 从「字幕时间轴完成，任务：#N」类文案解析任务 ID */
+function parseTimelineJobId(text: string): number | null {
+  const m = String(text).match(/任务：#(\d+)/)
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isFinite(n) ? n : null
+}
+
+/** 配音已产出或流水线已过配音阶段时，不再展示「继续生成音频」 */
+function shouldShowTimelineGenerateAudioButton(item: ChatMessage): boolean {
+  if (!isTimelineStepMessage(item)) return false
+  const jid = parseTimelineJobId(item.content)
+  if (jid == null) return false
+  const st = chatStore.jobStatusMap[jid]
+  const d = lastJobDetail.value
+  if (d?.job?.id === jid && (d.audios?.length ?? 0) > 0) return false
+  const ri = pipelineStageIndex('rendering_video')
+  if (st && ri >= 0 && pipelineStageIndex(st) >= ri) return false
+  if (st && (st === 'ready_for_review' || st === 'approved')) return false
+  return true
+}
+
+/** 与按钮一致：避免「下一步将进入配音」与已完成音频矛盾 */
+function timelineNextHint(item: ChatMessage): string {
+  const base = parseTimelineSummary(item.content).nextStep
+  if (shouldShowTimelineGenerateAudioButton(item)) return base
+  if (/配音|音频/.test(base)) return '配音已生成，可在下方「音频步骤完成」消息中试听或确认后继续。'
+  return base
+}
+
 function subtitleDraftFor(item: ChatMessage): string {
   if (subtitleDraftMap.value[item.id] != null) return subtitleDraftMap.value[item.id]
   const lines = parseSubtitlePreviewLines(item.content)
@@ -399,38 +540,61 @@ function subtitleDraftFor(item: ChatMessage): string {
   return fallback
 }
 
-async function onSaveSubtitles(item: ChatMessage) {
+function draftSubtitleCues(item: ChatMessage): { cues: Array<{ start: number; end: number; text: string }>; jid: number } | null {
   const jid = parseSubtitleJobId(item.content) ?? chatStore.activeJobId
-  if (!jid) {
-    ElMessage.warning('未识别到任务 ID')
-    return
-  }
+  if (!jid) return null
   const raw = (subtitleDraftMap.value[item.id] || '').trim()
-  if (!raw) {
-    ElMessage.warning('字幕内容不能为空')
-    return
-  }
+  if (!raw) return null
   const lines = raw.split('\n').map((x) => x.trim()).filter(Boolean)
+  if (!lines.length) return null
   const per = 2.5
   const cues = lines.map((text, idx) => ({
     start: Number((idx * per).toFixed(2)),
     end: Number(((idx + 1) * per).toFixed(2)),
     text,
   }))
-  await updateLatestSubtitles(jid, cues)
+  return { cues, jid }
+}
+
+async function onSaveSubtitles(item: ChatMessage) {
+  const built = draftSubtitleCues(item)
+  if (!built) {
+    ElMessage.warning('未识别到任务 ID 或字幕内容为空')
+    return
+  }
+  await updateLatestSubtitles(built.jid, built.cues)
   chatStore.appendAssistantMessage({
     id: uuidv4(),
     role: 'assistant',
-    content: `字幕已保存（任务 #${jid}，共 ${cues.length} 条）。如确认可发送「确认字幕」继续生成音频。`,
+    content: `字幕已保存（任务 #${built.jid}，共 ${built.cues.length} 条）。如确认可发送「确认字幕」继续生成音频。`,
     createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
   })
 }
+
 
 onMounted(() => {
   void chatStore.bootstrapTodayCandidates()
 })
 
 onBeforeUnmount(() => {
+  for (const arr of Object.values(uploadPreviewMap.value)) {
+    for (const u of arr) {
+      try {
+        URL.revokeObjectURL(u.objectUrl)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  for (const arr of Object.values(pendingUploadMap.value)) {
+    for (const u of arr) {
+      try {
+        URL.revokeObjectURL(u.objectUrl)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   if (previewAudio) {
     previewAudio.pause()
     previewAudio = null
@@ -548,6 +712,33 @@ function handleJobDetail(d: JobDetailResponse) {
   }
 }
 
+/** 不依赖右侧 Job 面板定时器：重跑 / 多步命令后持续拉详情并驱动对话内流水线卡片 */
+async function runJobDetailPollLoop(jobId: number, gen: number) {
+  for (let i = 0; i < 120; i++) {
+    if (gen !== jobDetailPollGen.value) return
+    try {
+      const d = await fetchJobDetail(jobId)
+      if (gen !== jobDetailPollGen.value) return
+      handleJobDetail(d)
+    } catch {
+      break
+    }
+    await new Promise((r) => setTimeout(r, 2000))
+  }
+}
+
+watch(
+  () => chatStore.pipelineResumeNonce,
+  (n) => {
+    if (n < 1) return
+    const jid = chatStore.activeJobId
+    if (jid == null) return
+    jobDetailPollGen.value += 1
+    const gen = jobDetailPollGen.value
+    void runJobDetailPollLoop(jid, gen)
+  },
+)
+
 function onStatusChange(payload: { jobId: number; status: string }) {
   chatStore.setJobStatus(payload.jobId, payload.status)
 }
@@ -587,16 +778,46 @@ function appendArtifactToChat(kind: JobArtifactKind) {
   void scrollToBottom()
 }
 
-function onPickAssets() {
+function onPickAssets(messageId?: string) {
+  activeAssetCardId.value = messageId || null
   uploadRef.value?.click()
+}
+
+function onPickAssetsFromComposer() {
+  onPickAssets()
 }
 
 async function onAssetsChange(e: Event) {
   const el = e.target as HTMLInputElement
   const files = Array.from(el.files || [])
   if (!files.length) return
-  await chatStore.uploadAssets(files)
+  const previews = files.map((f) => ({
+    id: uuidv4(),
+    name: f.name,
+    objectUrl: URL.createObjectURL(f),
+    media: (f.type.startsWith('video') ? 'video' : 'image') as 'image' | 'video',
+    file: f,
+  }))
+  const cardId = activeAssetCardId.value
+  if (cardId) {
+    // 素材卡片上传改为“先选再用”：上传后先放到卡片待选区，不立即参与流程。
+    pendingUploadMap.value[cardId] = [...(pendingUploadMap.value[cardId] || []), ...previews]
+    pickedUploadMap.value[cardId] = pickedUploadMap.value[cardId] || []
+  } else {
+    await chatStore.uploadAssets(files, {
+      previews: previews.map(({ name, objectUrl, media }) => ({ name, objectUrl, media })),
+      silentMessage: false,
+    })
+  }
   el.value = ''
+  activeAssetCardId.value = null
+}
+
+function toggleUploadedPick(messageId: string, uploadId: string) {
+  const cur = new Set(pickedUploadMap.value[messageId] || [])
+  if (cur.has(uploadId)) cur.delete(uploadId)
+  else cur.add(uploadId)
+  pickedUploadMap.value[messageId] = Array.from(cur)
 }
 
 function bumpRerenderDuration(delta: number) {
@@ -604,19 +825,11 @@ function bumpRerenderDuration(delta: number) {
 }
 
 async function onRerenderWithConfig() {
-  const customRules = [
-    rerenderForm.title_edit.trim() ? `标题：${rerenderForm.title_edit.trim()}` : '',
-    rerenderForm.intro_edit.trim() ? `简介：${rerenderForm.intro_edit.trim()}` : '',
-    rerenderForm.subtitle_edit.trim() ? `字幕风格：${rerenderForm.subtitle_edit.trim()}` : '',
-    rerenderForm.material_edit.trim() ? `素材要求：${rerenderForm.material_edit.trim()}` : '',
-  ]
-    .filter(Boolean)
-    .join('；')
   await chatStore.rerenderActiveJob({
-    instruction: customRules ? `请按以下要求重生成并严格执行：${customRules}` : undefined,
     duration_sec: rerenderForm.duration_sec,
     subtitle_tone: rerenderForm.subtitle_tone,
     tts_voice: rerenderForm.tts_voice,
+    aspect_ratio: rerenderForm.aspect_ratio,
     must_use_uploaded_assets: rerenderForm.must_use_uploaded_assets,
     prefer_video_assets: rerenderForm.prefer_video_assets,
   })
@@ -627,6 +840,131 @@ async function onInputEnter(e: KeyboardEvent) {
   if (e.shiftKey) return
   e.preventDefault()
   await onSend()
+}
+
+function pushLocalUserMessage(text: string) {
+  chatStore.messages.push({
+    id: uuidv4(),
+    role: 'user',
+    content: text,
+    createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  })
+}
+
+function splitSubtitleLines(raw: string): string[] {
+  const t = raw.trim()
+  if (!t) return []
+  const byLine = t
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean)
+  if (byLine.length > 1) return byLine
+  return t
+    .split(/[。！？!?；;]+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+}
+
+async function handleSlashCommand(text: string): Promise<boolean> {
+  // /sucai：在对话中加载素材候选卡片，支持勾选与上传，确认在卡片内完成
+  if (/^\/sucai(\s|$)/i.test(text)) {
+    pushLocalUserMessage(text)
+    const jid = chatStore.activeJobId
+    if (!jid) {
+      chatStore.appendAssistantMessage({
+        id: uuidv4(),
+        role: 'assistant',
+        content: '当前没有活动任务，请先「一键渲染」或选择任务后再用 /sucai。',
+        createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      })
+      return true
+    }
+    chatStore.loading = true
+    try {
+      const res = await postCommand('素材候选', jid)
+      if (res.active_job_id != null) chatStore.activeJobId = res.active_job_id
+      if (Array.isArray(res.candidates)) {
+        chatStore.lastCandidates = res.candidates.length > 0 ? res.candidates : null
+      }
+      chatStore.appendAssistantReply(res.reply)
+      chatStore.appendAssistantMessage({
+        id: uuidv4(),
+        role: 'assistant',
+        content:
+          '已在上方展示素材候选卡片：可勾选远程素材、点卡片内「本地上传」添加文件；完成后点「确认所选素材并继续」。',
+        createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      })
+    } catch (e) {
+      ElMessage.error(e instanceof Error ? e.message : '加载素材候选失败')
+    } finally {
+      chatStore.loading = false
+    }
+    onPickAssets()
+    void scrollToBottom()
+    return true
+  }
+
+  // /zimu：在对话中插入可编辑字幕气泡（默认带上一条已保存字幕；也可在命令后接草稿）
+  const zm = text.match(/^\/zimu(?:\s+([\s\S]+))?$/i)
+  if (zm) {
+    pushLocalUserMessage(text)
+    const jid = chatStore.activeJobId
+    if (!jid) {
+      chatStore.appendAssistantMessage({
+        id: uuidv4(),
+        role: 'assistant',
+        content: '当前没有活动任务，先执行「做第 N 条」或选择任务后再用 /zimu。',
+        createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      })
+      return true
+    }
+    let lines = splitSubtitleLines((zm[1] || '').trim())
+    if (!lines.length) {
+      try {
+        const d = await fetchJobDetail(jid)
+        lines = (d.subtitle_cues || [])
+          .map((c) => String(c.text || '').trim())
+          .filter(Boolean)
+      } catch (e) {
+        ElMessage.error(e instanceof Error ? e.message : '拉取任务详情失败')
+        return true
+      }
+    }
+    if (!lines.length) {
+      for (let i = chatStore.messages.length - 1; i >= 0; i--) {
+        const m = chatStore.messages[i]
+        if (!isSubtitleStepMessage(m)) continue
+        const mj = parseSubtitleJobId(m.content)
+        if (mj != null && mj !== jid) continue
+        const fromChat = parseSubtitlePreviewLines(m.content)
+        if (fromChat.length) {
+          lines = fromChat
+          break
+        }
+      }
+    }
+    if (!lines.length) {
+      chatStore.appendAssistantMessage({
+        id: uuidv4(),
+        role: 'assistant',
+        content: '当前任务还没有已保存的字幕。请先发送「生成字幕」，或用「/zimu 第一句。第二句」先写入草稿。',
+        createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      })
+      return true
+    }
+    const msg: ChatMessage = {
+      id: uuidv4(),
+      role: 'assistant',
+      content: buildSubtitleStepReply(jid, lines),
+      createdAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    }
+    subtitleDraftMap.value[msg.id] = lines.join('\n')
+    chatStore.appendAssistantMessage(msg)
+    void scrollToBottom()
+    return true
+  }
+
+  return false
 }
 
 function tierClass(tier: string) {
@@ -704,7 +1042,7 @@ function tierClass(tier: string) {
         <section class="right-panel">
           <div class="rerender-panel card">
             <div class="rerender-bar">
-              <span class="rerender-bar-title">重生成配置</span>
+              <span class="rerender-bar-title">配置</span>
               <div class="rerender-items">
                 <div class="rerender-item">
                   <label class="rerender-lbl" for="rerender-duration" title="视频时长，12～22 秒">时长</label>
@@ -762,6 +1100,20 @@ function tierClass(tier: string) {
                     <el-option v-for="v in TTS_VOICE_OPTIONS" :key="v.value" :label="v.label" :value="v.value" />
                   </el-select>
                 </div>
+                <div class="rerender-item">
+                  <label class="rerender-lbl" for="rerender-ratio">比例</label>
+                  <el-select
+                    id="rerender-ratio"
+                    v-model="rerenderForm.aspect_ratio"
+                    size="small"
+                    class="rerender-select"
+                    fit-input-width
+                    popper-class="rerender-select-dropdown rerender-subtitle-dropdown"
+                  >
+                    <el-option label="竖屏 9:16" value="9:16" />
+                    <el-option label="横屏 16:9" value="16:9" />
+                  </el-select>
+                </div>
                 <div class="rerender-item rerender-item-switch">
                   <span class="rerender-lbl rerender-lbl-wide" title="开启后仅使用已上传素材">仅已上传</span>
                   <el-switch v-model="rerenderForm.must_use_uploaded_assets" size="small" />
@@ -770,12 +1122,6 @@ function tierClass(tier: string) {
                   <span class="rerender-lbl rerender-lbl-wide" title="关闭则优先静态图">优先视频</span>
                   <el-switch v-model="rerenderForm.prefer_video_assets" size="small" />
                 </div>
-              </div>
-              <div class="rerender-edit-grid">
-                <el-input v-model="rerenderForm.title_edit" size="small" placeholder="改标题：例如 更抓眼、20字内" clearable />
-                <el-input v-model="rerenderForm.intro_edit" size="small" placeholder="改简介：例如 强调冲突与结果" clearable />
-                <el-input v-model="rerenderForm.subtitle_edit" size="small" placeholder="改字幕：例如 更口语、更短句" clearable />
-                <el-input v-model="rerenderForm.material_edit" size="small" placeholder="改素材：例如 多人物近景，减少Logo" clearable />
               </div>
               <el-button
                 class="btn-green rerender-submit-btn"
@@ -821,6 +1167,20 @@ function tierClass(tier: string) {
                   >
                     <pre class="artifact-pre">{{ item.content }}</pre>
                   </div>
+                  <div v-else-if="isUploadPreviewMessage(item)" class="bubble is-bot upload-preview-bubble">
+                    <p class="text upload-preview-text">{{ item.content }}</p>
+                    <div class="upload-preview-grid">
+                      <div
+                        v-for="(u, ui) in item.uploadPreviews"
+                        :key="`${item.id}-up-${ui}`"
+                        class="upload-preview-card"
+                      >
+                        <span class="upload-preview-name" :title="u.name">{{ u.name }}</span>
+                        <img v-if="u.media === 'image'" class="asset-preview-image" :src="u.objectUrl" alt="" />
+                        <video v-else class="asset-preview-video" :src="u.objectUrl" controls preload="metadata" />
+                      </div>
+                    </div>
+                  </div>
                   <div v-else-if="isFlowCardMessage(item)" class="bubble is-bot flow-card-bubble">
                     <div class="flow-card-head">
                       <div class="flow-card-title">
@@ -843,10 +1203,17 @@ function tierClass(tier: string) {
                   >
                     <div class="asset-candidates-title-row">
                       <div class="asset-candidates-title"><span class="flow-icon">🖼️</span>素材候选（请选择要使用的素材）</div>
+                      <button class="asset-submit-btn ghost" type="button" :disabled="chatStore.loading" @click="onPickAssets(item.id)">
+                        本地上传
+                      </button>
                       <button class="asset-submit-btn ghost" type="button" @click="toggleAllAssets(item.id, item.content)">
                         {{
-                          parseAssetCandidates(item.content).length > 0 &&
-                          parseAssetCandidates(item.content).every((x) => (pickedAssetMap[item.id] || []).includes(x.index))
+                          (
+                            (parseAssetCandidates(item.content).length === 0 ||
+                              parseAssetCandidates(item.content).every((x) => (pickedAssetMap[item.id] || []).includes(x.index))) &&
+                            ((pendingUploadMap[item.id] || []).length === 0 ||
+                              (pendingUploadMap[item.id] || []).every((u) => (pickedUploadMap[item.id] || []).includes(u.id)))
+                          )
                             ? '取消全选'
                             : '一键全选'
                         }}
@@ -866,8 +1233,40 @@ function tierClass(tier: string) {
                         <video v-else class="asset-preview-video" :src="cand.url" controls preload="metadata" />
                       </div>
                     </div>
+                    <div v-if="pendingUploadMap[item.id]?.length" class="upload-preview-inline">
+                      <div class="upload-preview-inline-title">已上传附件（请勾选后使用）</div>
+                      <div class="upload-preview-grid">
+                        <div
+                          v-for="u in pendingUploadMap[item.id]"
+                          :key="u.id"
+                          class="upload-preview-card selectable-upload"
+                          :class="(pickedUploadMap[item.id] || []).includes(u.id) ? 'is-selected' : ''"
+                          @click="toggleUploadedPick(item.id, u.id)"
+                        >
+                          <span class="upload-preview-name" :title="u.name">{{ u.name }}</span>
+                          <img v-if="u.media === 'image'" class="asset-preview-image" :src="u.objectUrl" alt="" />
+                          <video v-else class="asset-preview-video" :src="u.objectUrl" controls preload="metadata" />
+                        </div>
+                      </div>
+                    </div>
+                    <div v-if="uploadPreviewMap[item.id]?.length" class="upload-preview-inline">
+                      <div class="upload-preview-inline-title">已确认使用的上传素材</div>
+                      <div class="upload-preview-grid">
+                        <div
+                          v-for="(u, ui) in uploadPreviewMap[item.id]"
+                          :key="`${item.id}-inline-up-${ui}`"
+                          class="upload-preview-card"
+                        >
+                          <span class="upload-preview-name" :title="u.name">{{ u.name }}</span>
+                          <img v-if="u.media === 'image'" class="asset-preview-image" :src="u.objectUrl" alt="" />
+                          <video v-else class="asset-preview-video" :src="u.objectUrl" controls preload="metadata" />
+                        </div>
+                      </div>
+                    </div>
                     <div class="asset-candidate-actions">
-                      <button class="asset-submit-btn" type="button" @click="submitPickedAssets(item.id)">确认所选素材</button>
+                      <button class="asset-submit-btn primary-regen" type="button" :disabled="chatStore.loading" @click="submitPickedAssets(item.id)">
+                        确认所选素材并继续
+                      </button>
                       <button
                         class="asset-submit-btn ghost"
                         type="button"
@@ -936,8 +1335,8 @@ function tierClass(tier: string) {
                         </li>
                       </ol>
                     </div>
-                    <div class="timeline-next">{{ parseTimelineSummary(item.content).nextStep }}</div>
-                    <div class="subtitle-actions">
+                    <div class="timeline-next">{{ timelineNextHint(item) }}</div>
+                    <div v-if="shouldShowTimelineGenerateAudioButton(item)" class="subtitle-actions">
                       <button class="asset-submit-btn ghost" type="button" @click="onQuickSend('生成音频')">继续生成音频</button>
                     </div>
                   </div>
@@ -1049,7 +1448,7 @@ function tierClass(tier: string) {
                 :disabled="chatStore.loading"
                 title="上传素材"
                 aria-label="上传素材"
-                @click="onPickAssets"
+                @click="onPickAssetsFromComposer"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path
@@ -1067,10 +1466,22 @@ function tierClass(tier: string) {
                 class="composer-input"
                 type="textarea"
                 :rows="3"
-                placeholder="可直接发：改标题/改简介/改字幕/改素材 + 需求；Enter 发送，Shift+Enter 换行"
+                placeholder="支持 /sucai 在对话里选素材与上传，/zimu 在对话里改字幕；也可发 改标题/改简介/改素材 + 需求"
                 resize="none"
                 @keydown.enter="onInputEnter"
               />
+              <div v-if="showSlashPanel" class="slash-panel">
+                <button
+                  v-for="cmd in slashCommandOptions"
+                  :key="cmd.command"
+                  type="button"
+                  class="slash-item"
+                  @click="pickSlashCommand(cmd.template)"
+                >
+                  <span class="slash-cmd">{{ cmd.command }}</span>
+                  <span class="slash-desc">{{ cmd.description }}</span>
+                </button>
+              </div>
               <div class="composer-actions">
                 <button type="button" class="send-icon-btn" :disabled="!canSend" @click="onSend">
                   <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1102,6 +1513,7 @@ function tierClass(tier: string) {
           </div>
           <JobStatusPanel
             :job-id="chatStore.activeJobId"
+            :poll-kick="chatStore.pipelineResumeNonce"
             @status-change="onStatusChange"
             @job-detail="handleJobDetail"
           />
@@ -1344,12 +1756,6 @@ function tierClass(tier: string) {
   margin-left: 4px;
 }
 
-.rerender-edit-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
-  gap: 6px;
-  width: 100%;
-}
 
 .rerender-item :deep(.el-switch) {
   display: inline-flex;
@@ -1971,9 +2377,72 @@ function tierClass(tier: string) {
   box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.3);
 }
 
+.upload-preview-bubble {
+  width: min(680px, 100%);
+  border-radius: 14px;
+  border: 1px solid #4a5261;
+  background: linear-gradient(180deg, #313947 0%, #2a313d 100%);
+  padding: 12px 14px 14px;
+}
+
+.upload-preview-text {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #e2e8f0;
+}
+
+.upload-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.upload-preview-inline {
+  margin-top: 12px;
+  border-top: 1px solid rgba(148, 163, 184, 0.28);
+  padding-top: 10px;
+}
+
+.upload-preview-inline-title {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #cbd5e1;
+  font-weight: 700;
+}
+
+.upload-preview-card {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: #0f172a;
+}
+
+.selectable-upload {
+  cursor: pointer;
+}
+
+.selectable-upload.is-selected {
+  border-color: #8b5cf6;
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.35), 0 10px 18px rgba(0, 0, 0, 0.24);
+}
+
+.upload-preview-name {
+  display: block;
+  font-size: 11px;
+  color: #94a3b8;
+  padding: 6px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.6);
+}
+
 .asset-candidate-actions {
   margin-top: 12px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
 }
@@ -2120,8 +2589,14 @@ function tierClass(tier: string) {
 .subtitle-actions {
   margin-top: 10px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.asset-submit-btn.primary-regen {
+  background: linear-gradient(135deg, #0d9488, #0f766e);
+  border-color: #14b8a6;
 }
 
 .inline-audio {
@@ -2391,6 +2866,7 @@ function tierClass(tier: string) {
 }
 
 .composer-shell {
+  position: relative;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: end;
@@ -2404,6 +2880,52 @@ function tierClass(tier: string) {
 .composer-actions {
   display: inline-flex;
   align-items: center;
+}
+
+.slash-panel {
+  position: absolute;
+  left: 48px;
+  right: 44px;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  border: 1px solid #4c5665;
+  border-radius: 10px;
+  background: #252c37;
+  box-shadow: 0 16px 32px rgba(0, 0, 0, 0.34);
+  overflow: hidden;
+}
+
+.slash-item {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #e5eaf2;
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.slash-item + .slash-item {
+  border-top: 1px solid #3c4654;
+}
+
+.slash-item:hover {
+  background: #313947;
+}
+
+.slash-cmd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #93c5fd;
+}
+
+.slash-desc {
+  font-size: 12px;
+  color: #cbd5e1;
 }
 
 .hidden-upload {

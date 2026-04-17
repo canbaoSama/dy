@@ -31,3 +31,9 @@ backend/**/__pycache__/
 *.pyc
 .venv/
 venv/
+
+# 生成产物（前后端渲染临时/输出）
+videos/
+tmp_frames_18/
+tmp_frames_18_new/
+tmp_frames_18_new2/

@@ -4,7 +4,7 @@ import PipelineGraph from '@/components/PipelineGraph.vue'
 import { fetchJobDetail } from '@/api/factory'
 import type { JobDetailResponse } from '@/types/job'
 
-const props = defineProps<{ jobId: number | null }>()
+const props = defineProps<{ jobId: number | null; pollKick?: number }>()
 const emit = defineEmits<{
   (e: 'status-change', payload: { jobId: number; status: string }): void
   (e: 'job-detail', payload: JobDetailResponse): void
@@ -14,6 +14,8 @@ const detail = ref<JobDetailResponse | null>(null)
 const loading = ref(false)
 const err = ref<string | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
+/** 在此时间戳之前，即使任务处于「已结束」态也继续轮询，用于捕捉重跑刚启动时的状态 */
+let forcedPollUntil = 0
 
 const TERMINAL = new Set(['ready_for_review', 'approved', 'failed'])
 
@@ -32,7 +34,8 @@ async function load() {
     emit('status-change', { jobId: props.jobId, status: detail.value.job.status })
     emit('job-detail', detail.value)
     const st = detail.value.job.status
-    if (st && TERMINAL.has(st)) {
+    const inGrace = Date.now() < forcedPollUntil
+    if (st && TERMINAL.has(st) && !inGrace) {
       clearTimer()
     } else if (timer === null) {
       schedulePoll()
@@ -58,7 +61,8 @@ function schedulePoll() {
   if (props.jobId == null) return
   timer = setInterval(() => {
     const st = detail.value?.job.status
-    if (st && TERMINAL.has(st)) {
+    const inGrace = Date.now() < forcedPollUntil
+    if (st && TERMINAL.has(st) && !inGrace) {
       clearTimer()
       return
     }
@@ -77,6 +81,18 @@ watch(
     void load()
   },
   { immediate: true },
+)
+
+watch(
+  () => props.pollKick ?? 0,
+  (n, prev) => {
+    if (props.jobId == null) return
+    if (n <= 0) return
+    if (prev != null && n <= prev) return
+    forcedPollUntil = Date.now() + 180_000
+    clearTimer()
+    void load()
+  },
 )
 
 onBeforeUnmount(() => clearTimer())

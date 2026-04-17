@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -33,16 +34,25 @@ async def _safe_sync_sources(session: AsyncSession) -> None:
         await session.rollback()
 
 def _build_subtitle_draft_lines(item: NewsItem) -> list[str]:
+    """从正文生成字幕草稿：按句切分，保留整句，避免原先每行硬截 70 字导致半句话。"""
     content = str(item.cleaned_content or "").strip()
     if not content:
         content = str(item.summary_one_liner or item.title or "").strip()
     if not content:
         return ["（正文暂不可用，请稍后重试）"]
-    raw = [x.strip(" \t-•。") for x in content.replace("\r", "\n").split("\n")]
-    lines = [x for x in raw if x]
-    if not lines:
-        lines = [content[:120]]
-    return [x[:70] for x in lines[:8]]
+    # 先按换行，再按中英文句号类切句
+    pieces: list[str] = []
+    for block in content.replace("\r", "\n").split("\n"):
+        b = block.strip()
+        if not b:
+            continue
+        for seg in re.split(r"(?<=[。！？!?])\s*", b):
+            s = seg.strip()
+            if s:
+                pieces.append(s)
+    if not pieces:
+        pieces = [content.strip()[:400]]
+    return pieces[:14]
 
 
 async def _to_zh_lines(lines: list[str]) -> list[str]:
@@ -96,7 +106,7 @@ async def chat_command(
         job = VideoJob(
             news_item_id=item.id,
             status=JobStatus.created.value,
-            duration_sec=35,
+            duration_sec=18,
             style_notes="快讯",
         )
         session.add(job)
@@ -179,6 +189,19 @@ async def chat_command(
         chosen = [assets[i - 1] for i in idxs if 1 <= i <= len(assets)]
         if not chosen:
             return CommandResponse(reply="素材序号无效，请先发送「素材候选」查看列表。", active_job_id=jid)
+        r_old = await session.execute(
+            select(JobAsset).where(
+                JobAsset.job_id == jid,
+                JobAsset.asset_type.in_(["user_image", "user_video"]),
+            )
+        )
+        old_assets = list(r_old.scalars().all())
+        for a in old_assets:
+            meta = a.meta_json if isinstance(a.meta_json, dict) else {}
+            src = str(meta.get("from") or "").strip()
+            if src in {"chat_select", "remote_pick"}:
+                await session.delete(a)
+        await session.flush()
         save_dir = settings.assets_dir / f"job_{jid}" / "picked_remote"
         save_dir.mkdir(parents=True, exist_ok=True)
         existed = await session.scalar(select(func.count()).select_from(JobAsset).where(JobAsset.job_id == jid))
@@ -240,7 +263,8 @@ async def chat_command(
         lines = await _to_zh_lines(_build_subtitle_draft_lines(item))
         job.status = JobStatus.generating_subtitles.value
         await session.commit()
-        preview = "\n".join(f"- {x}" for x in lines[:6])
+        # 预览与对话框编辑共用：列出全部行，避免只显示前 6 条导致 /zimu 拉不到完整稿
+        preview = "\n".join(f"- {x}" for x in lines)
         return CommandResponse(
             reply=(
                 f"字幕步骤完成，任务：#{jid}，共 {len(lines)} 条。\n"

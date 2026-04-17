@@ -4,7 +4,8 @@ import type { JobDetailResponse } from '@/types/job'
 
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || '/api/v1',
-  timeout: 120_000,
+  /** 生成音频 / 多步命令链可能超过 2 分钟 */
+  timeout: 600_000,
 })
 
 export interface CommandResponse {
@@ -118,6 +119,7 @@ export async function triggerRerender(
     prefer_video_assets?: boolean
     subtitle_tone?: string
     tts_voice?: string
+    aspect_ratio?: '9:16' | '16:9'
   },
 ): Promise<{ ok: boolean; job_id: number; note: string }> {
   const { data } = await client.post<{ ok: boolean; job_id: number; note: string }>(`/jobs/${jobId}/rerender`, payload)
@@ -139,11 +141,13 @@ export async function previewTtsVoice(voice: string, text?: string): Promise<Blo
 export async function uploadJobAssets(
   jobId: number,
   files: File[],
+  options?: { replaceExisting?: boolean },
 ): Promise<{ ok: boolean; job_id: number; added: number; files: Array<{ name: string; asset_type: string }> }> {
   const form = new FormData()
   for (const f of files) form.append('files', f)
+  const qs = options?.replaceExisting ? '?replace_existing=true' : ''
   const { data } = await client.post<{ ok: boolean; job_id: number; added: number; files: Array<{ name: string; asset_type: string }> }>(
-    `/jobs/${jobId}/assets/upload`,
+    `/jobs/${jobId}/assets/upload${qs}`,
     form,
     { headers: { 'Content-Type': 'multipart/form-data' } },
   )
